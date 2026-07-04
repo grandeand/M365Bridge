@@ -1,0 +1,10 @@
+services:
+  m365bridge:
+    build: .
+    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    container_name: m365bridge
+    ports:
+      - "8230:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

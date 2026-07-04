@@ -1,0 +1,12 @@
+# Build artifacts
+bin/
+m365-bridge
+
+# Data files (includes .env, tokens, cache, setup.json)
+data/
+test_logs/*
+__pycache__/*
+*.py
+
+# Docker
+docker-data/

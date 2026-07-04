@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+m365-bridge
+
+# Runtime data (mounted as volume, not needed in image)
+data/
+docker-data/
+
+# Python (legacy, not used in Docker image)
+src/
+*.py
+*.cfg
+*.toml
+*.egg-info
+__pycache__/
+
+# Git and docs
+.git/
+.gitignore
+.github/
+*.md
+LICENSE
+
+# IDE and misc
+.vscode/
+.idea/
+.DS_Store
+test_logs/
+.playwright-mcp/
