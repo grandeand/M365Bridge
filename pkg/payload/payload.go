@@ -5,6 +5,7 @@ package payload
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,22 @@ var optionsSetsFull = []string{
 // fileUploadOptions contains option flags specific to file upload.
 var fileUploadOptions = map[string]bool{
 	"cwc_fileupload_odb": true,
+}
+
+// codeInterpreterOptions contains option flags that activate M365's built-in
+// code_interpreter sandbox. When client-defined tools are present, these MUST be
+// stripped to prevent M365 from intercepting file/code operations and routing
+// them to its own sandbox instead of emitting tool calls for the client.
+// This is the primary infrastructure lever (cramt/m365-copilot-proxy approach).
+var codeInterpreterOptions = map[string]bool{
+	"cwc_code_interpreter": true,
+	"cwc_code_interpreter_amsfix": true,
+	"cwcfluxgptv": true,
+	"gptvnorm2048": true,
+	"cwc_code_interpreter_citation_fix": true,
+	"code_interpreter_interactive_charts": true,
+	"cwc_code_interpreter_interactive_charts_inline_image": true,
+	"code_interpreter_matplotlib_patching": true,
 }
 
 // imageUploadOptions contains option flags needed for image upload support.
@@ -302,9 +319,11 @@ func formatUUID(hex string) string {
 }
 
 // BuildPayload constructs a chat request payload for a single message.
-func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpload bool, extraOptions []string) (string, error) {
+// When hasTools is true, code_interpreter option flags are stripped to prevent
+// M365 from intercepting file/code operations.
+func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpload, hasTools bool, extraOptions []string) (string, error) {
 	invocationID := uuid.New().String()
-	options := getOptions(enableFileUpload, false, extraOptions)
+	options := getOptions(enableFileUpload, false, hasTools, extraOptions)
 
 	payload := map[string]interface{}{
 		"type":         4,
@@ -351,7 +370,9 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 }
 
 // BuildConversationPayload constructs a chat request payload with conversation history.
-func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, gptOverride string, enableFileUpload bool, extraOptions []string) (string, error) {
+// When hasTools is true, code_interpreter option flags are stripped to prevent
+// M365 from intercepting file/code operations.
+func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, gptOverride string, enableFileUpload, hasTools bool, extraOptions []string) (string, error) {
 	invocationID := uuid.New().String()
 
 	// Extract annotations from the last message (images are attached to the last user message)
@@ -364,7 +385,7 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 		hasImages = len(annotations) > 0
 	}
 
-	options := getOptions(enableFileUpload, hasImages, extraOptions)
+	options := getOptions(enableFileUpload, hasImages, hasTools, extraOptions)
 
 	payload := map[string]interface{}{
 		"type":         4,
@@ -567,7 +588,9 @@ func buildM365History(messages []Message) []map[string]interface{} {
 }
 
 // getOptions returns the appropriate option set based on feature flags.
-func getOptions(enableFileUpload, enableImageUpload bool, extraOptions []string) []string {
+// When hasTools is true, code_interpreter flags are stripped to prevent M365
+// from routing file/code operations to its own sandbox.
+func getOptions(enableFileUpload, enableImageUpload, hasTools bool, extraOptions []string) []string {
 	options := make([]string, 0, len(optionsSetsFull))
 	options = append(options, optionsSetsFull...)
 
@@ -579,6 +602,20 @@ func getOptions(enableFileUpload, enableImageUpload bool, extraOptions []string)
 			}
 		}
 		options = filtered
+	}
+
+	// Strip code_interpreter flags when client-defined tools are present.
+	// This is the primary infrastructure lever: without it, M365 intercepts
+	// file operations before the LLM processes text instructions.
+	if hasTools {
+		filtered := make([]string, 0, len(options))
+		for _, opt := range options {
+			if !codeInterpreterOptions[opt] {
+				filtered = append(filtered, opt)
+			}
+		}
+		options = filtered
+		log.Printf("[TOOLCALL] getOptions hasTools=true, stripped code_interpreter flags, final options: %v", options)
 	}
 
 	if enableImageUpload {

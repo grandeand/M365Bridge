@@ -99,7 +99,7 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 
 		var result string
 		if options.NoStream {
-			result, err = cli.m365Client.Chat(text, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID)
+			result, err = cli.m365Client.Chat(text, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)
 			if err == nil && result != "" {
 				fmt.Println(result)
 			}
@@ -135,7 +135,7 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 	var err error
 
 	if options.NoStream {
-		result, err = cli.m365Client.Chat(options.Prompt, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID)
+		result, err = cli.m365Client.Chat(options.Prompt, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)
 		if err == nil && result != "" {
 			fmt.Println(result)
 		}
@@ -153,7 +153,7 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 // streamToStdout streams the response directly to stdout and returns the full text.
 func (cli *CLIServer) streamToStdout(text, tone, gptOverride, convID string) (string, error) {
 	fullText := ""
-	ch := cli.m365Client.ChatStreamGen(text, tone, gptOverride, convID, cli.config.UserOID, cli.config.TenantID)
+	ch := cli.m365Client.ChatStreamGen(text, tone, gptOverride, convID, cli.config.UserOID, cli.config.TenantID, false)
 	for chunk := range ch {
 		if chunk.Error != nil {
 			return fullText, chunk.Error

@@ -15,7 +15,19 @@ fail() { echo "  FAIL: $1"; FAILED=$((FAILED+1)); }
 skip() { echo "  SKIP: $1"; SKIPPED=$((SKIPPED+1)); }
 
 # Anthropic-style tool definitions (flat, no "function" wrapper)
+# Includes bash tool for shell-routing (cramt approach).
 TOOLS_JSON='[
+  {
+    "name": "bash",
+    "description": "Run a bash command on the local filesystem. Use this for file operations: cat to read, ls to list, heredocs to write.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {"type": "string", "description": "The bash command to execute"}
+      },
+      "required": ["command"]
+    }
+  },
   {
     "name": "write_file",
     "description": "Write content to a file on the local filesystem",
@@ -77,8 +89,8 @@ echo "  stop_reason: $STOP"
 echo "  tool_use names: $TOOL_USE_NAMES"
 echo "  text: ${TEXT:0:150}..."
 
-if echo "$TOOL_USE_NAMES" | jq -e 'index("write_file")' >/dev/null 2>&1; then
-    pass "Backend attempted to use write_file tool"
+if echo "$TOOL_USE_NAMES" | jq -e 'index("write_file") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use write_file or bash tool"
     TU_ID=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .id')
     TU_NAME=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .name')
     TU_INPUT=$(echo "$RESPONSE" | jq -c '.content[] | select(.type=="tool_use") | .input')
@@ -139,8 +151,8 @@ echo "  stop_reason: $STOP"
 echo "  tool_use names: $TOOL_USE_NAMES"
 echo "  text: ${TEXT:0:150}..."
 
-if echo "$TOOL_USE_NAMES" | jq -e 'index("read_file")' >/dev/null 2>&1; then
-    pass "Backend attempted to use read_file tool"
+if echo "$TOOL_USE_NAMES" | jq -e 'index("read_file") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use read_file or bash tool"
     TU_ID=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .id')
     TU_NAME=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .name')
     TU_INPUT=$(echo "$RESPONSE" | jq -c '.content[] | select(.type=="tool_use") | .input')
@@ -201,8 +213,8 @@ echo "  stop_reason: $STOP"
 echo "  tool_use names: $TOOL_USE_NAMES"
 echo "  text: ${TEXT:0:150}..."
 
-if echo "$TOOL_USE_NAMES" | jq -e 'index("list_files")' >/dev/null 2>&1; then
-    pass "Backend attempted to use list_files tool"
+if echo "$TOOL_USE_NAMES" | jq -e 'index("list_files") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use list_files or bash tool"
     TU_ID=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .id')
     TU_NAME=$(echo "$RESPONSE" | jq -r '.content[] | select(.type=="tool_use") | .name')
     TU_INPUT=$(echo "$RESPONSE" | jq -c '.content[] | select(.type=="tool_use") | .input')

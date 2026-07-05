@@ -209,14 +209,15 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 }
 
 // Chat sends a single message and returns the complete response.
-func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tenantID string) (string, error) {
+// When hasTools is true, code_interpreter option flags are stripped from the payload.
+func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
 	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
 
-	payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, nil)
+	payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, hasTools, nil)
 	if err != nil {
 		return "", err
 	}
@@ -226,10 +227,10 @@ func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tena
 
 // ChatStream sends a message and streams the response to stdout.
 // Returns the complete text.
-func (c *M365Client) ChatStream(text, tone, gptOverride, conversationID, userOID, tenantID string) (string, error) {
+func (c *M365Client) ChatStream(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
 	fullText := ""
 
-	ch := c.ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID)
+	ch := c.ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 	for chunk := range ch {
 		if chunk.Error != nil {
 			return "", chunk.Error
@@ -251,7 +252,8 @@ type StreamChunk struct {
 }
 
 // ChatStreamGen generates a stream of response chunks.
-func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID string) <-chan StreamChunk {
+// When hasTools is true, code_interpreter option flags are stripped from the payload.
+func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) <-chan StreamChunk {
 	ch := make(chan StreamChunk)
 
 	go func() {
@@ -264,7 +266,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 		}
 		defer conn.Close()
 
-		payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, nil)
+		payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, hasTools, nil)
 		if err != nil {
 			ch <- StreamChunk{Error: err}
 			return
@@ -386,8 +388,9 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 }
 
 // ChatConversation sends a conversation with history and returns the response.
-func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string) (string, string, []ToolCall, string, error) {
-	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID)
+// When hasTools is true, code_interpreter option flags are stripped from the payload.
+func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, error) {
+	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -414,7 +417,8 @@ type ConversationStreamChunk struct {
 }
 
 // ChatConversationStreamGen generates a stream of conversation response chunks.
-func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string) <-chan ConversationStreamChunk {
+// When hasTools is true, code_interpreter option flags are stripped from the payload.
+func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) <-chan ConversationStreamChunk {
 	ch := make(chan ConversationStreamChunk)
 
 	go func() {
@@ -430,7 +434,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 		}
 		defer conn.Close()
 
-		payloadStr, err := payload.BuildConversationPayload(hexSID, uuidSID, messages, tone, gptOverride, false, nil)
+		payloadStr, err := payload.BuildConversationPayload(hexSID, uuidSID, messages, tone, gptOverride, false, hasTools, nil)
 		if err != nil {
 			ch <- ConversationStreamChunk{Error: err}
 			return

@@ -452,10 +452,13 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// Upload any images found in multimodal content and attach annotations
 	api.uploadImagesAndAnnotate(&req.Messages, convID)
 
+	// Determine if client-defined tools are present (for optionsSets stripping)
+	hasTools := api.config.ToolCalling && len(req.Tools) > 0
+
 	if req.Stream {
-		api.streamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens)
+		api.streamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
 	} else {
-		api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens)
+		api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
 	}
 }
 
@@ -557,10 +560,13 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	// Upload any images found in multimodal content and attach annotations
 	api.uploadImagesAndAnnotate(&chatMessages, convID)
 
+	// Determine if client-defined tools are present (for optionsSets stripping)
+	hasTools := api.config.ToolCalling && len(req.Tools) > 0
+
 	if req.Stream {
-		api.streamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID)
+		api.streamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	} else {
-		api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID)
+		api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	}
 }
 
@@ -599,7 +605,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 		convID = api.ctxCache.Get("session:" + sid)
 	}
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
@@ -640,7 +646,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 }
 
 // streamChatCompletions streams chat completion responses in OpenAI format.
-func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int) {
+func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -655,7 +661,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	chunkID := fmt.Sprintf("chatcmpl-%s", uuid.New().String())
 	openaiModel := cfg.OpenAIID
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	hasContent := false
 	fullText := ""
@@ -725,7 +731,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText)
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
 		if len(parsedCalls) > 0 {
 			fullText = cleanedText
 			simToolCalls = parsedCalls
@@ -818,8 +824,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 }
 
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
-func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -827,7 +833,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText)
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
 		if len(parsedCalls) > 0 {
 			respText = cleanedText
 			finishReason = "tool_calls"
@@ -837,6 +843,31 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 					Type:     "function",
 					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 				})
+			}
+		} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
+			// Anti-confabulation retry: model claimed it can't access files without
+			// calling a tool. Force a retry in the same conversation.
+			retryMsg := []payload.Message{
+				{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
+			}
+			retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+			if retryErr == nil {
+				retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
+				if len(retryParsed) > 0 {
+					respText = retryCleaned
+					finishReason = "tool_calls"
+					for _, pc := range retryParsed {
+						toolCalls = append(toolCalls, client.ToolCall{
+							ID:       pc.ID,
+							Type:     "function",
+							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+						})
+					}
+				} else {
+					respText = retryText
+					finishReason = retryFinish
+					toolCalls = retryToolCalls
+				}
 			}
 		}
 	}
@@ -912,7 +943,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 }
 
 // streamAnthropicMessages streams messages in Anthropic SSE format.
-func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string) {
+func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -954,7 +985,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	textBlockOpen := false
 	blockIndex := 0
 	toolCallingEnabled := api.config.ToolCalling
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -1039,7 +1070,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText)
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
 		if len(parsedCalls) > 0 {
 			fullText = cleanedText
 			simToolCalls = parsedCalls
@@ -1148,8 +1179,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
-func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -1157,7 +1188,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText)
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
 		if len(parsedCalls) > 0 {
 			respText = cleanedText
 			finishReason = "tool_calls"
@@ -1167,6 +1198,31 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 					Type:     "function",
 					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 				})
+			}
+		} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
+			// Anti-confabulation retry: model claimed it can't access files without
+			// calling a tool. Force a retry in the same conversation.
+			retryMsg := []payload.Message{
+				{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
+			}
+			retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+			if retryErr == nil {
+				retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
+				if len(retryParsed) > 0 {
+					respText = retryCleaned
+					finishReason = "tool_calls"
+					for _, pc := range retryParsed {
+						toolCalls = append(toolCalls, client.ToolCall{
+							ID:       pc.ID,
+							Type:     "function",
+							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+						})
+					}
+				} else {
+					respText = retryText
+					finishReason = retryFinish
+					toolCalls = retryToolCalls
+				}
 			}
 		}
 	}
@@ -1249,7 +1305,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	compID := fmt.Sprintf("cmpl-%s", uuid.New().String())
 	openaiModel := cfg.OpenAIID
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 
 	fullText := ""
 	thinkingText := ""
@@ -1352,7 +1408,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 // nonStreamCompletions handles non-streaming text completion.
 func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string) {
-	respText, thinking, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
+	respText, thinking, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return

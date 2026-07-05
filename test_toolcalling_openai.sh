@@ -23,7 +23,23 @@ fail() { echo "  FAIL: $1"; FAILED=$((FAILED+1)); }
 skip() { echo "  SKIP: $1"; SKIPPED=$((SKIPPED+1)); }
 
 # Tool definitions (harmless client-side tools)
+# Includes bash tool for shell-routing: model emits ```bash blocks that get
+# routed to the bash tool, enabling agentic loops (cramt approach).
 TOOLS_JSON='[
+  {
+    "type": "function",
+    "function": {
+      "name": "bash",
+      "description": "Run a bash command on the local filesystem. Use this for file operations: cat to read, ls to list, heredocs to write.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "The bash command to execute"}
+        },
+        "required": ["command"]
+      }
+    }
+  },
   {
     "type": "function",
     "function": {
@@ -93,8 +109,8 @@ echo "  finish_reason: $FINISH"
 echo "  tool_calls: $TOOL_CALLS"
 echo "  content: ${CONTENT:0:150}..."
 
-if echo "$TOOL_CALLS" | jq -e 'index("write_file")' >/dev/null 2>&1; then
-    pass "Backend attempted to use write_file tool"
+if echo "$TOOL_CALLS" | jq -e 'index("write_file") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use write_file or bash tool"
     # Send follow-up with fake tool result
     TC_ID=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].id')
     TC_NAME=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].function.name')
@@ -155,8 +171,8 @@ echo "  finish_reason: $FINISH"
 echo "  tool_calls: $TOOL_CALLS"
 echo "  content: ${CONTENT:0:150}..."
 
-if echo "$TOOL_CALLS" | jq -e 'index("read_file")' >/dev/null 2>&1; then
-    pass "Backend attempted to use read_file tool"
+if echo "$TOOL_CALLS" | jq -e 'index("read_file") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use read_file or bash tool"
     TC_ID=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].id')
     TC_NAME=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].function.name')
     TC_ARGS=$(echo "$RESPONSE" | jq -c '.choices[0].message.tool_calls[0].function.arguments')
@@ -215,8 +231,8 @@ echo "  finish_reason: $FINISH"
 echo "  tool_calls: $TOOL_CALLS"
 echo "  content: ${CONTENT:0:150}..."
 
-if echo "$TOOL_CALLS" | jq -e 'index("list_files")' >/dev/null 2>&1; then
-    pass "Backend attempted to use list_files tool"
+if echo "$TOOL_CALLS" | jq -e 'index("list_files") or index("bash")' >/dev/null 2>&1; then
+    pass "Backend attempted to use list_files or bash tool"
     TC_ID=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].id')
     TC_NAME=$(echo "$RESPONSE" | jq -r '.choices[0].message.tool_calls[0].function.name')
     TC_ARGS=$(echo "$RESPONSE" | jq -c '.choices[0].message.tool_calls[0].function.arguments')
