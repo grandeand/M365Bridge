@@ -164,8 +164,15 @@ window.fetch = async function(...args) {
       const clone = resp.clone();
       const data = await clone.json();
       if (data.refresh_token) {
+        const cookies = document.cookie.split(';').map(c => {
+          const [name, ...rest] = c.trim().split('=');
+          return {name, value: rest.join('=')};
+        }).filter(c => c.name && c.value);
         console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
+        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
+        console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
+        console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
+        console.log('Then add them to the sso_cookies array in your setup.json manually.');
       }
     } catch(e) {}
   }
@@ -184,8 +191,15 @@ XMLHttpRequest.prototype.send = function(body) {
       try {
         const data = JSON.parse(this.responseText);
         if (data.refresh_token) {
+          const cookies = document.cookie.split(';').map(c => {
+            const [name, ...rest] = c.trim().split('=');
+            return {name, value: rest.join('=')};
+          }).filter(c => c.name && c.value);
           console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
+          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
+          console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
+          console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
+          console.log('Then add them to the sso_cookies array in your setup.json manually.');
         }
       } catch(e) {}
     }
@@ -222,7 +236,7 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 </details>
 
 4. Watch the console for: `===== COPY THE COMPLETE JSON LINE BELOW =====`
-5. Copy the JSON output (it contains `oid`, `tenant`, and `refresh_token`)
+5. Copy the JSON output (it contains `oid`, `tenant`, `refresh_token`, and `sso_cookies`)
 6. Save it to `data/setup.json`
 7. Run the wizard to verify and save the configuration:
 
