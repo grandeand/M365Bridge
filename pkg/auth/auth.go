@@ -147,6 +147,64 @@ func (tm *TokenManager) Refresh() (string, error) {
 	return result.AccessToken, nil
 }
 
+// GetTokenForScope exchanges the refresh token for an access token with a
+// different scope (e.g. PowerPlatform or BAP). Does NOT cache or rotate the
+// refresh token — use Refresh() for the primary M365 scope.
+func (tm *TokenManager) GetTokenForScope(scope string) (string, error) {
+	return tm.GetTokenForScopeAndClient(scope, tm.clientID)
+}
+
+// GetTokenForScopeAndClient exchanges the refresh token for an access token
+// with a different scope AND a different client ID (RT exchange). Used for
+// APIs that require a token issued to a specific SPA client (e.g. Copilot
+// Studio's Island Gateway requires client_id 96ff4394-9197-43aa-b393-6a41652e21f8).
+func (tm *TokenManager) GetTokenForScopeAndClient(scope, clientID string) (string, error) {
+	refreshToken, err := tm.readRefreshToken()
+	if err != nil {
+		return "", err
+	}
+
+	data := url.Values{}
+	data.Set("client_id", clientID)
+	data.Set("refresh_token", refreshToken)
+	data.Set("grant_type", "refresh_token")
+	data.Set("scope", scope)
+
+	req, err := http.NewRequest("POST", tm.tokenURL, bytes.NewBufferString(data.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to create request", ErrRefreshFailed)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrRefreshFailed, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to read response", ErrRefreshFailed)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("%w: failed to parse response", ErrRefreshFailed)
+	}
+
+	return result.AccessToken, nil
+}
+
 // readRefreshToken reads and decrypts the refresh token from file.
 func (tm *TokenManager) readRefreshToken() (string, error) {
 	data, err := os.ReadFile(tm.refreshFile)

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,12 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
+	"github.com/google/uuid"
 	"github.com/pkoukk/tiktoken-go"
 )
 
@@ -142,8 +143,6 @@ const tokenRefreshInterval = 30 * time.Minute
 // Start starts the HTTP server on the specified port.
 func (api *APIServer) Start(port int) error {
 	api.mu.Lock()
-	defer api.mu.Unlock()
-
 	// Initialize client
 	api.m365Client = client.NewM365Client(api.tokenManager)
 	api.stopCh = make(chan struct{})
@@ -160,6 +159,7 @@ func (api *APIServer) Start(port int) error {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
+	api.mu.Unlock()
 
 	// Start background token refresher
 	go api.runTokenRefresher()
@@ -397,25 +397,35 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
 	var req struct {
-		Model          string                   `json:"model"`
-		Messages       []payload.Message        `json:"messages"`
-		Stream         bool                     `json:"stream"`
-		MaxTokens      int                      `json:"max_tokens"`
-		ResponseFormat map[string]interface{}   `json:"response_format"`
-		SessionID      string                   `json:"session_id"`
-		User           string                   `json:"user"`
-		Tools          []toolcalling.ToolDef    `json:"tools"`
+		Model          string                 `json:"model"`
+		Messages       []payload.Message      `json:"messages"`
+		Stream         bool                   `json:"stream"`
+		MaxTokens      int                    `json:"max_tokens"`
+		ResponseFormat map[string]interface{} `json:"response_format"`
+		SessionID      string                 `json:"session_id"`
+		User           string                 `json:"user"`
+		Tools          []toolcalling.ToolDef  `json:"tools"`
+		ToolChoice     interface{}            `json:"tool_choice"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
 
-	cfg := models.LookupModel(req.Model)
+	// Parse optional session ID encoded in model name: "gpt5.5:my-session"
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", req.Model))
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
 
@@ -426,14 +436,22 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Inject tool definitions into last user message if tool calling is enabled
+	// Inject tool definitions into last user message if tool calling is enabled.
+	// In simulated mode, the entire request JSON is sent as the prompt instead.
 	if api.config.ToolCalling && len(req.Tools) > 0 {
-		injectToolDefs(&req.Messages, req.Tools)
+		if api.config.ToolCallingMode == "simulated" {
+			injectSimulatedPrompt(&req.Messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+		} else {
+			injectToolDefs(&req.Messages, req.Tools)
+		}
 	}
 
 	// Resolve session ID and conversation ID
-	// Priority: request body session_id > request body user > X-Session-Id header > hash(api_key + first_user_message)
-	sid := req.SessionID
+	// Priority: model-name session ID > request body session_id > request body user > X-Session-Id header > hash(api_key + first_user_message)
+	sid := modelSessionID
+	if sid == "" {
+		sid = req.SessionID
+	}
 	if sid == "" {
 		sid = req.User
 	}
@@ -486,9 +504,11 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	cfg := models.LookupModel(req.Model)
+	// Parse optional session ID encoded in model name: "gpt5.5:my-session"
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", req.Model))
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
 
@@ -496,7 +516,10 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	messages := api.fimToChat(req.Prompt, req.Suffix)
 
 	// Resolve session ID and conversation ID
-	sid := api.getSessionID(r, nil)
+	sid := modelSessionID
+	if sid == "" {
+		sid = api.getSessionID(r, nil)
+	}
 	var convID string
 	if sid != "" {
 		convID = api.ctxCache.Get("session:" + sid)
@@ -521,12 +544,12 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	var req struct {
-		Model       string            `json:"model"`
-		Messages    []payload.Message `json:"messages"`
-		System      string            `json:"system"`
-		MaxTokens   int               `json:"max_tokens"`
-		Stream      bool              `json:"stream"`
-		Temperature float64           `json:"temperature"`
+		Model       string                `json:"model"`
+		Messages    []payload.Message     `json:"messages"`
+		System      string                `json:"system"`
+		MaxTokens   int                   `json:"max_tokens"`
+		Stream      bool                  `json:"stream"`
+		Temperature float64               `json:"temperature"`
 		Tools       []toolcalling.ToolDef `json:"tools"`
 	}
 
@@ -535,8 +558,10 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Parse optional session ID encoded in model name: "gpt5.5:my-session"
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	// Map Anthropic model to internal model
-	cfg := models.LookupModel(req.Model)
+	cfg := models.LookupModel(modelKey)
 
 	// Build chat messages with system prompt prepended
 	chatMessages := []payload.Message{}
@@ -551,7 +576,10 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	// Resolve session ID and conversation ID
-	sid := api.getSessionID(r, nil)
+	sid := modelSessionID
+	if sid == "" {
+		sid = api.getSessionID(r, nil)
+	}
 	var convID string
 	if sid != "" {
 		convID = api.ctxCache.Get("session:" + sid)
@@ -594,12 +622,17 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	cfg := models.LookupModel(req.Model)
+	// Parse optional session ID encoded in model name: "gpt5.5:my-session"
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	cfg := models.LookupModel(modelKey)
 
 	messages := api.fimToChat(req.Prompt, "")
 
 	// Resolve session ID and conversation ID
-	sid := api.getSessionID(r, nil)
+	sid := modelSessionID
+	if sid == "" {
+		sid = api.getSessionID(r, nil)
+	}
 	var convID string
 	if sid != "" {
 		convID = api.ctxCache.Get("session:" + sid)
@@ -668,9 +701,11 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	thinkingText := ""
 	truncated := false
 
-	// When tool calling is enabled, buffer all text and parse for tool calls at the end.
-	// Tool call blocks may span multiple chunks, so we can't parse incrementally.
-	toolCallingEnabled := api.config.ToolCalling
+	// When tool calling is enabled AND tools are present, buffer all text and
+	// parse for tool calls at the end. Tool call blocks may span multiple
+	// chunks, so we can't parse incrementally. When no tools are present, stream
+	// text directly regardless of the global ToolCalling flag.
+	toolCallingEnabled := api.config.ToolCalling && hasTools
 
 	for chunk := range ch {
 		if chunk.Error != nil {
@@ -687,7 +722,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 			thinkingText += chunk.Thinking
 			if !hasContent {
 				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
-					"role":             "assistant",
+					"role":              "assistant",
 					"reasoning_content": chunk.Thinking,
 				})
 				hasContent = true
@@ -731,12 +766,25 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
-		if len(parsedCalls) > 0 {
-			fullText = cleanedText
-			simToolCalls = parsedCalls
+		if api.config.ToolCallingMode == "simulated" {
+			sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+			if sim.HasPayload {
+				if len(sim.ToolCalls) > 0 {
+					simToolCalls = sim.ToolCalls
+					fullText = ""
+				} else {
+					fullText = sim.Content
+				}
+			}
+		} else {
+			cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
+			if len(parsedCalls) > 0 {
+				fullText = cleanedText
+				simToolCalls = parsedCalls
+			}
 		}
 	}
+
 
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
@@ -758,6 +806,13 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	api.mu.RLock()
 	toolCalls := api.m365Client.LastToolCalls()
 	api.mu.RUnlock()
+
+	// In simulated mode, discard backend-injected tool calls (e.g.
+	// code_interpreter) — only client-declared tools parsed from the
+	// simulated JSON response are valid.
+	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+		toolCalls = nil
+	}
 
 	// Append simulated tool calls
 	for _, stc := range simToolCalls {
@@ -831,42 +886,68 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 		return
 	}
 
+	// In simulated mode, discard backend-injected tool calls (e.g.
+	// code_interpreter) — only client-declared tools parsed from the
+	// simulated JSON response are valid.
+	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+		toolCalls = nil
+	}
+
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
-		if len(parsedCalls) > 0 {
-			respText = cleanedText
-			finishReason = "tool_calls"
-			for _, pc := range parsedCalls {
-				toolCalls = append(toolCalls, client.ToolCall{
-					ID:       pc.ID,
-					Type:     "function",
-					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-				})
-			}
-		} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
-			// Anti-confabulation retry: model claimed it can't access files without
-			// calling a tool. Force a retry in the same conversation.
-			retryMsg := []payload.Message{
-				{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
-			}
-			retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-			if retryErr == nil {
-				retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
-				if len(retryParsed) > 0 {
-					respText = retryCleaned
+		if api.config.ToolCallingMode == "simulated" {
+			sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+			if sim.HasPayload {
+				if len(sim.ToolCalls) > 0 {
 					finishReason = "tool_calls"
-					for _, pc := range retryParsed {
+					for _, pc := range sim.ToolCalls {
 						toolCalls = append(toolCalls, client.ToolCall{
 							ID:       pc.ID,
 							Type:     "function",
 							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 						})
 					}
+					respText = ""
 				} else {
-					respText = retryText
-					finishReason = retryFinish
-					toolCalls = retryToolCalls
+					respText = sim.Content
+				}
+			}
+		} else {
+			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
+			if len(parsedCalls) > 0 {
+				respText = cleanedText
+				finishReason = "tool_calls"
+				for _, pc := range parsedCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+			} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
+				// Anti-confabulation retry: model claimed it can't access files without
+				// calling a tool. Force a retry in the same conversation.
+				retryMsg := []payload.Message{
+					{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
+				}
+				retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+				if retryErr == nil {
+					retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
+					if len(retryParsed) > 0 {
+						respText = retryCleaned
+						finishReason = "tool_calls"
+						for _, pc := range retryParsed {
+							toolCalls = append(toolCalls, client.ToolCall{
+								ID:       pc.ID,
+								Type:     "function",
+								Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+							})
+						}
+					} else {
+						respText = retryText
+						finishReason = retryFinish
+						toolCalls = retryToolCalls
+					}
 				}
 			}
 		}
@@ -984,7 +1065,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	thinkingBlockOpen := false
 	textBlockOpen := false
 	blockIndex := 0
-	toolCallingEnabled := api.config.ToolCalling
+	toolCallingEnabled := api.config.ToolCalling && hasTools
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	for chunk := range ch {
@@ -1110,6 +1191,13 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	toolCalls := api.m365Client.LastToolCalls()
 	api.mu.RUnlock()
 
+	// In simulated mode, discard backend-injected tool calls (e.g.
+	// code_interpreter) — only client-declared tools parsed from the
+	// simulated JSON response are valid.
+	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+		toolCalls = nil
+	}
+
 	// Append simulated tool calls
 	for _, stc := range simToolCalls {
 		toolCalls = append(toolCalls, client.ToolCall{
@@ -1186,42 +1274,68 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		return
 	}
 
+	// In simulated mode, discard backend-injected tool calls (e.g.
+	// code_interpreter) — only client-declared tools parsed from the
+	// simulated JSON response are valid.
+	if api.config.ToolCalling && api.config.ToolCallingMode == "simulated" {
+		toolCalls = nil
+	}
+
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
-		if len(parsedCalls) > 0 {
-			respText = cleanedText
-			finishReason = "tool_calls"
-			for _, pc := range parsedCalls {
-				toolCalls = append(toolCalls, client.ToolCall{
-					ID:       pc.ID,
-					Type:     "function",
-					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-				})
-			}
-		} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
-			// Anti-confabulation retry: model claimed it can't access files without
-			// calling a tool. Force a retry in the same conversation.
-			retryMsg := []payload.Message{
-				{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
-			}
-			retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-			if retryErr == nil {
-				retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
-				if len(retryParsed) > 0 {
-					respText = retryCleaned
+		if api.config.ToolCallingMode == "simulated" {
+			sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+			if sim.HasPayload {
+				if len(sim.ToolCalls) > 0 {
 					finishReason = "tool_calls"
-					for _, pc := range retryParsed {
+					for _, pc := range sim.ToolCalls {
 						toolCalls = append(toolCalls, client.ToolCall{
 							ID:       pc.ID,
 							Type:     "function",
 							Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
 						})
 					}
+					respText = ""
 				} else {
-					respText = retryText
-					finishReason = retryFinish
-					toolCalls = retryToolCalls
+					respText = sim.Content
+				}
+			}
+		} else {
+			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
+			if len(parsedCalls) > 0 {
+				respText = cleanedText
+				finishReason = "tool_calls"
+				for _, pc := range parsedCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+			} else if hasTools && toolcalling.LooksLikeConfabulation(respText) {
+				// Anti-confabulation retry: model claimed it can't access files without
+				// calling a tool. Force a retry in the same conversation.
+				retryMsg := []payload.Message{
+					{Role: "user", Content: "You have not used any tool. Do not claim you cannot access files or that files are empty. Emit a single ```bash block now to inspect the files and run commands. Act, do not explain."},
+				}
+				retryText, _, retryToolCalls, retryFinish, retryErr := api.m365Client.ChatConversation(retryMsg, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+				if retryErr == nil {
+					retryCleaned, retryParsed := toolcalling.ParseToolCalls(retryText, tools)
+					if len(retryParsed) > 0 {
+						respText = retryCleaned
+						finishReason = "tool_calls"
+						for _, pc := range retryParsed {
+							toolCalls = append(toolCalls, client.ToolCall{
+								ID:       pc.ID,
+								Type:     "function",
+								Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+							})
+						}
+					} else {
+						respText = retryText
+						finishReason = retryFinish
+						toolCalls = retryToolCalls
+					}
 				}
 			}
 		}
@@ -1636,12 +1750,76 @@ func injectToolDefs(messages *[]payload.Message, tools []toolcalling.ToolDef) {
 	}
 }
 
+// injectSimulatedPrompt replaces the last user message with a simulated-mode
+// prompt that embeds the entire OpenAI request JSON and asks M365 Copilot to
+// produce a valid chat.completion response in a single ```json block.
+func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice string) {
+	if len(*messages) == 0 {
+		return
+	}
+	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
+	for i := len(*messages) - 1; i >= 0; i-- {
+		if (*messages)[i].Role == "user" {
+			(*messages)[i].Content = prompt
+			break
+		}
+	}
+}
+
+// toolChoiceString normalizes the tool_choice field to a string ("auto",
+// "required", "none", or a function name) for prompt-building purposes.
+func toolChoiceString(toolChoice interface{}) string {
+	if toolChoice == nil {
+		return ""
+	}
+	if s, ok := toolChoice.(string); ok {
+		return s
+	}
+	if m, ok := toolChoice.(map[string]interface{}); ok {
+		if fn, ok := m["function"].(map[string]interface{}); ok {
+			if name, ok := fn["name"].(string); ok {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// parseModelSessionID splits a model string of the form "modelKey:sessionID"
+// into its components. If there is no colon, sessionID is empty.
+// This allows clients that cannot send custom headers/body fields (e.g. Droid
+// CLI) to encode a session ID directly in the model name, e.g.
+// "gpt5.5-reasoning:dev-test-session-001".
+func parseModelSessionID(model string) (modelKey, sessionID string) {
+	idx := strings.IndexByte(model, ':')
+	if idx < 0 {
+		return model, ""
+	}
+	return model[:idx], model[idx+1:]
+}
+
+// toolNamesFromDefs extracts the function names from a slice of tool
+// definitions, for filtering M365-invented tool calls (e.g. code_interpreter)
+// out of simulated responses.
+func toolNamesFromDefs(tools []toolcalling.ToolDef) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t.Function.Name != "" {
+			names = append(names, t.Function.Name)
+		}
+	}
+	return names
+}
+
 // fimToChat converts FIM (fill-in-the-middle) prompts to chat format.
 func (api *APIServer) fimToChat(prompt, suffix string) []payload.Message {
 	if suffix != "" {
 		return []payload.Message{
 			{
-				Role: "user",
+				Role:    "user",
 				Content: fmt.Sprintf("Complete the middle of the following text naturally.\n\n--- BEGIN TEXT ---\n%s\n--- MIDDLE ---\n%s\n--- END ---\n\nWrite only the middle part that connects the two sections.", prompt, suffix),
 			},
 		}

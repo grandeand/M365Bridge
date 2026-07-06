@@ -5,7 +5,6 @@ package payload
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -615,7 +614,6 @@ func getOptions(enableFileUpload, enableImageUpload, hasTools bool, extraOptions
 			}
 		}
 		options = filtered
-		log.Printf("[TOOLCALL] getOptions hasTools=true, stripped code_interpreter flags, final options: %v", options)
 	}
 
 	if enableImageUpload {

@@ -483,6 +483,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 					continue
 				}
 
+
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
 						if args, ok := data["arguments"].([]interface{}); ok {
