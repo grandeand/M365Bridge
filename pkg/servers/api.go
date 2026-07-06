@@ -543,17 +543,25 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
 	var req struct {
-		Model       string                `json:"model"`
-		Messages    []payload.Message     `json:"messages"`
-		System      string                `json:"system"`
-		MaxTokens   int                   `json:"max_tokens"`
-		Stream      bool                  `json:"stream"`
-		Temperature float64               `json:"temperature"`
-		Tools       []toolcalling.ToolDef `json:"tools"`
+		Model       string                 `json:"model"`
+		Messages    []payload.Message      `json:"messages"`
+		System      string                 `json:"system"`
+		MaxTokens   int                    `json:"max_tokens"`
+		Stream      bool                   `json:"stream"`
+		Temperature float64                `json:"temperature"`
+		Tools       []toolcalling.ToolDef  `json:"tools"`
+		ToolChoice  map[string]interface{} `json:"tool_choice"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -570,9 +578,15 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	chatMessages = append(chatMessages, req.Messages...)
 
-	// Inject tool definitions into last user message if tool calling is enabled
+	// Inject tool definitions into last user message if tool calling is enabled.
+	// In simulated mode, the entire Anthropic request JSON is sent as the prompt
+	// instead (Anthropic-native — no OpenAI conversion).
 	if api.config.ToolCalling && len(req.Tools) > 0 {
-		injectToolDefs(&chatMessages, req.Tools)
+		if api.config.ToolCallingMode == "simulated" {
+			injectSimulatedPromptAnthropic(&chatMessages, string(bodyBytes), anthropicToolChoiceString(req.ToolChoice))
+		} else {
+			injectToolDefs(&chatMessages, req.Tools)
+		}
 	}
 
 	// Resolve session ID and conversation ID
@@ -910,7 +924,14 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 					respText = ""
 				} else {
 					respText = sim.Content
+					finishReason = "stop"
 				}
+			} else {
+				// M365 did not return a simulated JSON payload (e.g. it ran
+				// its own server-side tools and returned plain text). Since
+				// we discarded backend-injected toolCalls above, reset the
+				// finish reason so we don't report tool_use with no blocks.
+				finishReason = "stop"
 			}
 		} else {
 			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
@@ -1151,10 +1172,22 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	// Parse simulated tool calls from full text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
 	if toolCallingEnabled {
-		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
-		if len(parsedCalls) > 0 {
-			fullText = cleanedText
-			simToolCalls = parsedCalls
+		if api.config.ToolCallingMode == "simulated" {
+			sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools))
+			if sim.HasPayload {
+				if len(sim.ToolCalls) > 0 {
+					simToolCalls = sim.ToolCalls
+					fullText = ""
+				} else {
+					fullText = sim.Content
+				}
+			}
+		} else {
+			cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText, tools)
+			if len(parsedCalls) > 0 {
+				fullText = cleanedText
+				simToolCalls = parsedCalls
+			}
 		}
 	}
 
@@ -1284,7 +1317,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if api.config.ToolCalling {
 		if api.config.ToolCallingMode == "simulated" {
-			sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+			sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools))
 			if sim.HasPayload {
 				if len(sim.ToolCalls) > 0 {
 					finishReason = "tool_calls"
@@ -1298,7 +1331,14 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 					respText = ""
 				} else {
 					respText = sim.Content
+					finishReason = "stop"
 				}
+			} else {
+				// M365 did not return a simulated JSON payload (e.g. it ran
+				// its own server-side tools and returned plain text). Since
+				// we discarded backend-injected toolCalls above, reset the
+				// finish reason so we don't report tool_use with no blocks.
+				finishReason = "stop"
 			}
 		} else {
 			cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText, tools)
@@ -1764,6 +1804,35 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 			break
 		}
 	}
+}
+
+// injectSimulatedPromptAnthropic replaces the last user message with a
+// simulated-mode prompt that embeds the entire Anthropic request JSON and asks
+// M365 Copilot to produce a valid Anthropic Messages response in a single
+// ```json block.
+func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, toolChoice string) {
+	if len(*messages) == 0 {
+		return
+	}
+	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
+	for i := len(*messages) - 1; i >= 0; i-- {
+		if (*messages)[i].Role == "user" {
+			(*messages)[i].Content = prompt
+			break
+		}
+	}
+}
+
+// anthropicToolChoiceString normalizes the Anthropic tool_choice field to a
+// string ("any", "auto", "tool", or "") for prompt-building purposes.
+func anthropicToolChoiceString(toolChoice map[string]interface{}) string {
+	if toolChoice == nil {
+		return ""
+	}
+	if t, ok := toolChoice["type"].(string); ok {
+		return t
+	}
+	return ""
 }
 
 // toolChoiceString normalizes the tool_choice field to a string ("auto",

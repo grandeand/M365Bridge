@@ -53,6 +53,46 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 	return strings.Join(lines, "\n")
 }
 
+// BuildSimulatedPromptAnthropic constructs the prompt sent to M365 Copilot in
+// simulated mode for Anthropic Messages API clients. It embeds the full
+// Anthropic /v1/messages request JSON and instructs the model to return a
+// valid Anthropic message response inside a single ```json code block.
+//
+// requestJSON is the serialized Anthropic /v1/messages request body.
+// hasTools indicates whether the request carries client-defined tools.
+// toolChoice is the Anthropic tool_choice value ("any", "auto", "tool", or "").
+func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice string) string {
+	lines := []string{
+		"The JSON payload below is an entire request for the Anthropic Messages API format.",
+		"The JSON payload below is an entire request for POST /v1/messages.",
+		"Interpret it exactly in Anthropic Messages format and produce the corresponding response in the same format.",
+		"Focus on producing a valid response object that matches the expected Anthropic format for this request.",
+		"Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
+		`If the payload has "stream": true, still return the final completed JSON object (not SSE events).`,
+	}
+
+	if hasTools {
+		lines = append(lines,
+			"Tool calls are supported here: emit assistant tool calls when appropriate.",
+			`If returning tool calls, use content blocks with "type": "tool_use" and set stop_reason to "tool_use".`,
+			"Do not refuse by saying tool invocation is unsupported.",
+			`For each tool_use block, "input" must be a JSON object (not a string).`,
+			"CRITICAL: Only use tool names that appear in the tools array of the request payload. Never invent tool names.",
+			"NEVER emit a tool_use block with name \"code_interpreter\" or any name not present in the request's tools array.",
+			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
+		)
+		switch strings.ToLower(strings.TrimSpace(toolChoice)) {
+		case "any":
+			lines = append(lines, "This request requires at least one tool call. Do not return a plain-text-only assistant response.")
+		case "tool":
+			lines = append(lines, "This request requires a specific tool call. Do not return a plain-text-only assistant response.")
+		}
+	}
+
+	lines = append(lines, "```json", requestJSON, "```")
+	return strings.Join(lines, "\n")
+}
+
 // SimulatedResult holds the parsed simulated response.
 type SimulatedResult struct {
 	Content      string      // assistant message content (empty if tool calls present)
@@ -102,6 +142,165 @@ func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedRes
 	result.HasPayload = true
 	parseChatCompletionPayload(best, &result, allowed)
 	return result
+}
+
+// ParseSimulatedResponseAnthropic extracts a simulated Anthropic Messages
+// response from M365 Copilot's raw text output. It enumerates JSON candidates,
+// scores them by Anthropic message shape, and parses tool_use blocks / text
+// content from the best candidate.
+//
+// allowedToolNames is the set of tool names the client actually declared. Any
+// tool_use block whose name is NOT in this set is silently dropped.
+func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string) SimulatedResult {
+	allowed := make(map[string]bool, len(allowedToolNames))
+	for _, n := range allowedToolNames {
+		allowed[strings.TrimSpace(n)] = true
+	}
+
+	result := SimulatedResult{FinishReason: "stop"}
+	candidates := enumerateJSONCandidates(text)
+	if len(candidates) == 0 {
+		return result
+	}
+
+	var best map[string]interface{}
+	bestScore := -1 << 30
+	for _, raw := range candidates {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			continue
+		}
+		score := scoreAnthropicCandidate(parsed)
+		if score > bestScore {
+			bestScore = score
+			best = parsed
+		}
+	}
+	if best == nil || bestScore <= 0 {
+		return result
+	}
+
+	result.HasPayload = true
+	parseAnthropicPayload(best, &result, allowed)
+	return result
+}
+
+// parseAnthropicPayload extracts tool_use blocks and text content from an
+// Anthropic message-shaped JSON object. Tool calls whose name is not in
+// `allowed` (when non-empty) are dropped.
+func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool) {
+	// stop_reason
+	if sr, ok := payload["stop_reason"].(string); ok && sr != "" {
+		if sr == "tool_use" {
+			result.FinishReason = "tool_calls"
+		} else {
+			result.FinishReason = "stop"
+		}
+	}
+
+	content, ok := payload["content"].([]interface{})
+	if !ok || len(content) == 0 {
+		// Some models put text directly in a "text" field
+		if t, ok := payload["text"].(string); ok && t != "" {
+			result.Content = t
+		}
+		return
+	}
+
+	var textParts []string
+	for _, block := range content {
+		bm, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := bm["type"].(string)
+		switch blockType {
+		case "text":
+			if t, ok := bm["text"].(string); ok && t != "" {
+				textParts = append(textParts, t)
+			}
+		case "tool_use":
+			name, _ := bm["name"].(string)
+			if name == "" {
+				continue
+			}
+			if len(allowed) > 0 && !allowed[name] {
+				continue
+			}
+			id, _ := bm["id"].(string)
+			if id == "" {
+				id = nextToolCallID()
+			}
+			// input is a JSON object in Anthropic format
+			var argsBytes []byte
+			if input, ok := bm["input"]; ok && input != nil {
+				argsBytes, _ = json.Marshal(input)
+			} else {
+				argsBytes = []byte("{}")
+			}
+			result.ToolCalls = append(result.ToolCalls, ToolCall{
+				ID:        id,
+				Name:      name,
+				Arguments: json.RawMessage(argsBytes),
+			})
+		}
+	}
+
+	if len(result.ToolCalls) > 0 {
+		result.Content = ""
+		result.FinishReason = "tool_calls"
+		return
+	}
+	result.Content = strings.Join(textParts, "\n")
+}
+
+// scoreAnthropicCandidate scores a parsed JSON object by how much it resembles
+// an Anthropic Messages response. Higher is better; <=0 means unusable.
+func scoreAnthropicCandidate(candidate map[string]interface{}) int {
+	score := 0
+	if isRequestLikeSimulatedPayload(candidate) {
+		score -= 180
+	}
+
+	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
+	content, hasContent := candidate["content"].([]interface{})
+	if hasContent && len(content) > 0 {
+		score += 220
+		// Check for tool_use / text blocks
+		for _, block := range content {
+			if bm, ok := block.(map[string]interface{}); ok {
+				if bt, ok := bm["type"].(string); ok {
+					if bt == "tool_use" {
+						score += 90
+					} else if bt == "text" {
+						if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
+							score += 35
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if role, ok := candidate["role"].(string); ok && strings.ToLower(role) == "assistant" {
+		score += 30
+	}
+	if t, ok := candidate["type"].(string); ok && strings.ToLower(t) == "message" {
+		score += 70
+	}
+	if sr, ok := candidate["stop_reason"].(string); ok && sr != "" {
+		score += 25
+	}
+	if id, ok := candidate["id"].(string); ok && strings.HasPrefix(strings.ToLower(id), "msg_") {
+		score += 50
+	}
+
+	// Penalize OpenAI-shaped objects (choices array)
+	if _, ok := candidate["choices"].([]interface{}); ok {
+		score -= 100
+	}
+
+	return score
 }
 
 // parseChatCompletionPayload extracts tool calls and content from a
