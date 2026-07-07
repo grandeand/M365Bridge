@@ -68,10 +68,29 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
 
+      - name: Extract changelog section for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract the section for this version from CHANGELOG.md
+          # Matches from "## [VERSION]" to the next "## [" or end of file
+          BODY=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]") > 0) { found=1; next }
+            }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            BODY="Release ${VERSION}. See CHANGELOG.md for details."
+          fi
+          # Write to file to preserve multiline in GitHub Actions
+          echo "$BODY" > release_notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*
