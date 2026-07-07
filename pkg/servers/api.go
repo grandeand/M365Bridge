@@ -150,6 +150,7 @@ func (api *APIServer) Start(port int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.handleChatCompletions))
 	mux.HandleFunc("/v1/completions", api.withAuth(api.handleCompletions))
+	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
 	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/models", api.withAuth(api.handleModels))
@@ -1821,4 +1822,780 @@ func truncateToTokens(text string, maxTokens int) (string, bool) {
 		return text, false
 	}
 	return strings.Join(words[:maxTokens], " "), true
+}
+
+// ===================================================================
+// OpenAI Responses API (/v1/responses)
+// ===================================================================
+
+// responsesRequest is the JSON body for POST /v1/responses.
+type responsesRequest struct {
+	Model              string                 `json:"model"`
+	Input              interface{}            `json:"input"`
+	Instructions       string                 `json:"instructions"`
+	Stream             bool                   `json:"stream"`
+	MaxOutputTokens    int                    `json:"max_output_tokens"`
+	Tools              []toolcalling.ToolDef  `json:"tools"`
+	ToolChoice         interface{}            `json:"tool_choice"`
+	Temperature        float64                `json:"temperature"`
+	PreviousResponseID string                 `json:"previous_response_id"`
+	SessionID          string                 `json:"session_id"`
+	User               string                 `json:"user"`
+	Metadata           map[string]interface{} `json:"metadata"`
+}
+
+// handleResponses handles OpenAI Responses API requests.
+func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
+	var req responsesRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+
+	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
+	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	cfg := models.LookupModel(modelKey)
+	if cfg.OpenAIID == "" {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
+		return
+	}
+
+	// Convert Responses API input to payload.Message list
+	messages := responsesInputToMessages(req.Input)
+
+	// Prepend instructions as first user message (M365 has no system role)
+	if strings.TrimSpace(req.Instructions) != "" && len(messages) > 0 {
+		instrMsg := payload.Message{
+			Role:    "user",
+			Content: "Instructions: " + strings.TrimSpace(req.Instructions),
+		}
+		messages = append([]payload.Message{instrMsg}, messages...)
+	}
+
+	// Inject simulated tool prompt if tools are present
+	if len(req.Tools) > 0 {
+		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+	}
+
+	// Resolve session ID
+	// Priority: model-name session > previous_response_id > body session_id > body user > header > hash
+	sid := modelSessionID
+	if sid == "" {
+		sid = req.PreviousResponseID
+	}
+	if sid == "" {
+		sid = req.SessionID
+	}
+	if sid == "" {
+		sid = req.User
+	}
+	if sid == "" {
+		sid = r.Header.Get("X-Session-Id")
+	}
+	if sid == "" {
+		sid = api.hashSessionIDFromMessages(r, messages)
+	}
+
+	var convID string
+	if sid != "" {
+		convID = api.ctxCache.Get("session:" + sid)
+	}
+
+	// Upload any images found in multimodal content
+	api.uploadImagesAndAnnotate(&messages, convID)
+
+	hasTools := len(req.Tools) > 0
+
+	if req.Stream {
+		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+	} else {
+		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+	}
+}
+
+// responsesInputToMessages converts the Responses API input field (string or
+// array of input items) to a slice of payload.Message.
+func responsesInputToMessages(input interface{}) []payload.Message {
+	if input == nil {
+		return []payload.Message{{Role: "user", Content: ""}}
+	}
+
+	// Simple string input
+	if s, ok := input.(string); ok {
+		return []payload.Message{{Role: "user", Content: s}}
+	}
+
+	// Array input
+	arr, ok := input.([]interface{})
+	if !ok {
+		return []payload.Message{{Role: "user", Content: ""}}
+	}
+
+	var messages []payload.Message
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		itemType, _ := m["type"].(string)
+
+		// Handle function_call_output items (tool results)
+		if itemType == "function_call_output" {
+			callID, _ := m["call_id"].(string)
+			output, _ := m["output"].(string)
+			messages = append(messages, payload.Message{
+				Role:    "tool",
+				Content: output,
+				Name:    callID,
+			})
+			continue
+		}
+
+		// Handle function_call items (assistant tool calls in input history)
+		if itemType == "function_call" {
+			name, _ := m["name"].(string)
+			args, _ := m["arguments"].(string)
+			messages = append(messages, payload.Message{
+				Role:    "assistant",
+				Content: fmt.Sprintf("Tool call: %s(%s)", name, args),
+			})
+			continue
+		}
+
+		// Handle reasoning items (skip, M365 generates its own)
+		if itemType == "reasoning" {
+			continue
+		}
+
+		// Message items (type "message" or items with role)
+		role, _ := m["role"].(string)
+		if role == "" {
+			role = "user"
+		}
+
+		content := responsesExtractContent(m["content"])
+		messages = append(messages, payload.Message{
+			Role:    role,
+			Content: content,
+		})
+	}
+
+	if len(messages) == 0 {
+		return []payload.Message{{Role: "user", Content: ""}}
+	}
+	return messages
+}
+
+// responsesExtractContent extracts text from a content field that may be a
+// string or an array of content parts (input_text, output_text, text types).
+func responsesExtractContent(content interface{}) string {
+	if content == nil {
+		return ""
+	}
+	if s, ok := content.(string); ok {
+		return s
+	}
+	arr, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, part := range arr {
+		p, ok := part.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ptype, _ := p["type"].(string)
+		if ptype == "input_text" || ptype == "output_text" || ptype == "text" {
+			if text, ok := p["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// buildResponsesObject constructs the non-streaming Responses API response object.
+func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, finishReason string, promptTok, completionTok, reasoningTok int) map[string]interface{} {
+	status := "completed"
+	if finishReason == "length" {
+		status = "incomplete"
+	}
+
+	output := []map[string]interface{}{}
+	outputIndex := 0
+
+	// Add reasoning item if thinking is present
+	if thinking != "" {
+		reasoningID := fmt.Sprintf("rs_%s", responseID)
+		output = append(output, map[string]interface{}{
+			"id":     reasoningID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]interface{}{
+				{
+					"type": "summary_text",
+					"text": thinking,
+				},
+			},
+		})
+		outputIndex++
+	}
+
+	// Add function_call items for tool calls
+	for i, tc := range toolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", i)
+		}
+		output = append(output, map[string]interface{}{
+			"id":        callID,
+			"type":      "function_call",
+			"status":    "completed",
+			"call_id":   callID,
+			"name":      tc.Function.Name,
+			"arguments": tc.Function.Arguments,
+		})
+		outputIndex++
+	}
+
+	// Add message item with output_text (only if there is text content)
+	if text != "" || len(toolCalls) == 0 {
+		msgID := fmt.Sprintf("msg_%s", responseID)
+		output = append(output, map[string]interface{}{
+			"id":     msgID,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"content": []map[string]interface{}{
+				{
+					"type":        "output_text",
+					"text":        text,
+					"annotations": []interface{}{},
+				},
+			},
+		})
+		outputIndex++
+	}
+
+	resp := map[string]interface{}{
+		"id":         responseID,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"status":     status,
+		"model":      model,
+		"output":     output,
+		"output_text": text,
+		"usage": map[string]interface{}{
+			"input_tokens":     promptTok,
+			"output_tokens":    completionTok,
+			"reasoning_tokens": reasoningTok,
+			"total_tokens":     promptTok + completionTok + reasoningTok,
+		},
+	}
+	return resp
+}
+
+// nonStreamResponses handles non-streaming Responses API requests.
+func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	if err != nil {
+		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+		return
+	}
+
+	// In simulated mode, discard backend-injected tool calls
+	if hasTools {
+		toolCalls = nil
+	}
+
+	// Parse simulated tool calls from response text
+	if hasTools {
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+				for _, pc := range sim.ToolCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+				respText = ""
+			} else {
+				respText = sim.Content
+				finishReason = "stop"
+			}
+		} else {
+			finishReason = "stop"
+		}
+	}
+
+	// Enforce max_output_tokens
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText = truncated
+			finishReason = "length"
+		}
+	}
+
+	promptStr := fmt.Sprint(messages)
+	promptTok := countTokens(promptStr)
+	completionTok := countTokens(respText)
+	reasoningTok := countTokens(thinking)
+
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
+
+	api.sendJSON(w, http.StatusOK, response)
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+}
+
+// streamResponses handles streaming Responses API requests.
+func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return
+	}
+
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	openaiModel := cfg.OpenAIID
+
+	// Helper to send a Responses SSE event
+	sendEvent := func(eventType string, data map[string]interface{}) {
+		data["type"] = eventType
+		jsonData, _ := json.Marshal(data)
+		fmt.Fprintf(w, "data: %s\n\n", jsonData)
+		flusher.Flush()
+	}
+
+	// Send response.created event
+	sendEvent("response.created", map[string]interface{}{
+		"response": map[string]interface{}{
+			"id":     responseID,
+			"object": "response",
+			"status": "in_progress",
+			"model":  openaiModel,
+		},
+	})
+
+	// Send response.in_progress event
+	sendEvent("response.in_progress", map[string]interface{}{
+		"response": map[string]interface{}{
+			"id":     responseID,
+			"object": "response",
+			"status": "in_progress",
+			"model":  openaiModel,
+		},
+	})
+
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+
+	fullText := ""
+	thinkingText := ""
+	truncated := false
+
+	// When tool calling is enabled, buffer all text and parse at the end
+	toolCallingEnabled := hasTools
+
+	// Track whether we've emitted the message output item
+	messageItemEmitted := false
+	reasoningItemEmitted := false
+	msgID := fmt.Sprintf("msg_%s", responseID)
+	reasoningID := fmt.Sprintf("rs_%s", responseID)
+
+	for chunk := range ch {
+		if chunk.Error != nil {
+			sendEvent("response.failed", map[string]interface{}{
+				"response": map[string]interface{}{
+					"id":     responseID,
+					"object": "response",
+					"status": "failed",
+					"error": map[string]interface{}{
+						"message": chunk.Error.Error(),
+						"type":    "server_error",
+					},
+					"model": openaiModel,
+				},
+			})
+			return
+		}
+
+		if chunk.IsFinal {
+			break
+		}
+
+		// Handle thinking/reasoning content
+		if chunk.Thinking != "" {
+			thinkingText += chunk.Thinking
+
+			if !toolCallingEnabled {
+				if !reasoningItemEmitted {
+					sendEvent("response.output_item.added", map[string]interface{}{
+						"output_index": 0,
+						"item": map[string]interface{}{
+							"id":     reasoningID,
+							"type":   "reasoning",
+							"status": "in_progress",
+							"summary": []map[string]interface{}{
+								{
+									"type": "summary_text",
+									"text": "",
+								},
+							},
+						},
+					})
+					reasoningItemEmitted = true
+				}
+				sendEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+					"item_id":      reasoningID,
+					"output_index": 0,
+					"delta":        chunk.Thinking,
+				})
+			}
+		}
+
+		// Handle text content
+		if chunk.Text != "" {
+			if toolCallingEnabled {
+				// Buffer text for tool call parsing at the end
+				fullText += chunk.Text
+			} else {
+				if !messageItemEmitted {
+					// Emit message output item
+					outputIdx := 0
+					if reasoningItemEmitted {
+						outputIdx = 1
+					}
+					sendEvent("response.output_item.added", map[string]interface{}{
+						"output_index": outputIdx,
+						"item": map[string]interface{}{
+							"id":     msgID,
+							"type":   "message",
+							"status": "in_progress",
+							"role":   "assistant",
+							"content": []interface{}{},
+						},
+					})
+					sendEvent("response.content_part.added", map[string]interface{}{
+						"item_id":      msgID,
+						"output_index": outputIdx,
+						"content_index": 0,
+						"part": map[string]interface{}{
+							"type": "output_text",
+							"text": "",
+							"annotations": []interface{}{},
+						},
+					})
+					messageItemEmitted = true
+				}
+
+				// Check max_tokens
+				if maxTokens > 0 && countTokens(fullText+chunk.Text) > maxTokens {
+					remaining := maxTokens - countTokens(fullText)
+					if remaining > 0 {
+						delta, _ := truncateToTokens(chunk.Text, remaining)
+						if delta != "" {
+							fullText += delta
+							outputIdx := 0
+							if reasoningItemEmitted {
+								outputIdx = 1
+							}
+							sendEvent("response.output_text.delta", map[string]interface{}{
+								"item_id":       msgID,
+								"output_index":  outputIdx,
+								"content_index": 0,
+								"delta":         delta,
+							})
+						}
+					}
+					truncated = true
+					// Drain remaining chunks
+					go func() {
+						for range ch {
+						}
+					}()
+					break
+				}
+
+				fullText += chunk.Text
+				outputIdx := 0
+				if reasoningItemEmitted {
+					outputIdx = 1
+				}
+				sendEvent("response.output_text.delta", map[string]interface{}{
+					"item_id":       msgID,
+					"output_index":  outputIdx,
+					"content_index": 0,
+					"delta":         chunk.Text,
+				})
+			}
+		}
+	}
+
+	// Finalize reasoning item if emitted
+	if reasoningItemEmitted && !toolCallingEnabled {
+		sendEvent("response.reasoning_summary_text.done", map[string]interface{}{
+			"item_id":      reasoningID,
+			"output_index": 0,
+			"text":         thinkingText,
+		})
+		sendEvent("response.output_item.done", map[string]interface{}{
+			"output_index": 0,
+			"item": map[string]interface{}{
+				"id":     reasoningID,
+				"type":   "reasoning",
+				"status": "completed",
+				"summary": []map[string]interface{}{
+					{
+						"type": "summary_text",
+						"text": thinkingText,
+					},
+				},
+			},
+		})
+	}
+
+	// Handle tool calling: parse buffered text for simulated tool calls
+	var toolCalls []client.ToolCall
+	finishReason := "stop"
+
+	if toolCallingEnabled {
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+				for _, pc := range sim.ToolCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+				fullText = ""
+			} else {
+				fullText = sim.Content
+				finishReason = "stop"
+			}
+		} else {
+			finishReason = "stop"
+		}
+
+		// Now emit the buffered text and tool calls as Responses events
+		outputIdx := 0
+		if reasoningItemEmitted {
+			outputIdx = 1
+		}
+
+		// Emit tool call items
+		for i, tc := range toolCalls {
+			callID := tc.ID
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", i)
+			}
+			sendEvent("response.output_item.added", map[string]interface{}{
+				"output_index": outputIdx,
+				"item": map[string]interface{}{
+					"id":      callID,
+					"type":    "function_call",
+					"status":  "in_progress",
+					"call_id": callID,
+					"name":    tc.Function.Name,
+				},
+			})
+			sendEvent("response.function_call_arguments.delta", map[string]interface{}{
+				"item_id":      callID,
+				"output_index": outputIdx,
+				"delta":        tc.Function.Arguments,
+			})
+			sendEvent("response.function_call_arguments.done", map[string]interface{}{
+				"item_id":      callID,
+				"output_index": outputIdx,
+				"arguments":    tc.Function.Arguments,
+			})
+			sendEvent("response.output_item.done", map[string]interface{}{
+				"output_index": outputIdx,
+				"item": map[string]interface{}{
+					"id":        callID,
+					"type":      "function_call",
+					"status":    "completed",
+					"call_id":   callID,
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+			})
+			outputIdx++
+		}
+
+		// Emit text message item if there's text
+		if fullText != "" || len(toolCalls) == 0 {
+			// Enforce max_output_tokens
+			if maxTokens > 0 {
+				if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
+					fullText = truncated
+					finishReason = "length"
+				}
+			}
+
+			sendEvent("response.output_item.added", map[string]interface{}{
+				"output_index": outputIdx,
+				"item": map[string]interface{}{
+					"id":     msgID,
+					"type":   "message",
+					"status": "in_progress",
+					"role":   "assistant",
+					"content": []interface{}{},
+				},
+			})
+			sendEvent("response.content_part.added", map[string]interface{}{
+				"item_id":      msgID,
+				"output_index": outputIdx,
+				"content_index": 0,
+				"part": map[string]interface{}{
+					"type": "output_text",
+					"text": "",
+					"annotations": []interface{}{},
+				},
+			})
+			sendEvent("response.output_text.delta", map[string]interface{}{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
+				"content_index": 0,
+				"delta":         fullText,
+			})
+			sendEvent("response.output_text.done", map[string]interface{}{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
+				"content_index": 0,
+				"text":          fullText,
+			})
+			sendEvent("response.content_part.done", map[string]interface{}{
+				"item_id":      msgID,
+				"output_index": outputIdx,
+				"content_index": 0,
+				"part": map[string]interface{}{
+					"type": "output_text",
+					"text": fullText,
+					"annotations": []interface{}{},
+				},
+			})
+			sendEvent("response.output_item.done", map[string]interface{}{
+				"output_index": outputIdx,
+				"item": map[string]interface{}{
+					"id":     msgID,
+					"type":   "message",
+					"status": "completed",
+					"role":   "assistant",
+					"content": []map[string]interface{}{
+						{
+							"type":        "output_text",
+							"text":        fullText,
+							"annotations": []interface{}{},
+						},
+					},
+				},
+			})
+		}
+	} else {
+		// Non-tool-calling mode: finalize message item if emitted
+		if messageItemEmitted {
+			outputIdx := 0
+			if reasoningItemEmitted {
+				outputIdx = 1
+			}
+			if truncated {
+				finishReason = "length"
+			}
+			sendEvent("response.output_text.done", map[string]interface{}{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
+				"content_index": 0,
+				"text":          fullText,
+			})
+			sendEvent("response.content_part.done", map[string]interface{}{
+				"item_id":      msgID,
+				"output_index": outputIdx,
+				"content_index": 0,
+				"part": map[string]interface{}{
+					"type": "output_text",
+					"text": fullText,
+					"annotations": []interface{}{},
+				},
+			})
+			sendEvent("response.output_item.done", map[string]interface{}{
+				"output_index": outputIdx,
+				"item": map[string]interface{}{
+					"id":     msgID,
+					"type":   "message",
+					"status": "completed",
+					"role":   "assistant",
+					"content": []map[string]interface{}{
+						{
+							"type":        "output_text",
+							"text":        fullText,
+							"annotations": []interface{}{},
+						},
+					},
+				},
+			})
+		}
+	}
+
+	// Build final response object for response.completed
+	status := "completed"
+	if finishReason == "length" {
+		status = "incomplete"
+	}
+
+	promptStr := fmt.Sprint(messages)
+	promptTok := countTokens(promptStr)
+	completionTok := countTokens(fullText)
+	reasoningTok := countTokens(thinkingText)
+
+	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, thinkingText, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse["status"] = status
+
+	sendEvent("response.completed", map[string]interface{}{
+		"response": finalResponse,
+	})
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
 }

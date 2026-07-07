@@ -430,6 +430,7 @@ print(resp.choices[0].message.content)
 |-----------------------------|-----------------------------------------------------|
 | `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming) |
 | `POST /v1/completions`      | OpenAI text completion (streaming + non-streaming)  |
+| `POST /v1/responses`        | OpenAI Responses API (streaming + non-streaming)    |
 | `POST /v1/messages`         | Anthropic Messages format (dedicated SSE handlers)  |
 | `POST /v1/complete`         | Anthropic Complete (FIM)                            |
 | `GET /v1/models`            | Model list                                          |
@@ -582,6 +583,79 @@ Response:
 - When M365 Copilot runs its own server-side tools (web search, code interpreter) and returns plain text instead of a simulated JSON payload, the response is returned as a normal text completion with `finish_reason: "stop"`.
 - `tool_result` messages (OpenAI) and `tool_use`/`tool_result` content blocks (Anthropic) in conversation history are converted to plain text before being sent to M365, since the M365 backend does not understand tool roles.
 - Streaming endpoints buffer the full response before parsing tool calls (tool call JSON may span multiple chunks).
+
+## Responses API
+
+The `/v1/responses` endpoint implements the OpenAI Responses API format. It accepts `input` (string or array of typed items), `instructions`, `max_output_tokens`, `tools`, and `previous_response_id` for conversation continuity.
+
+### Example (non-streaming)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5",
+    "input": "What is 2+2?",
+    "session_id": "my-session"
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "created_at": 1234567890,
+  "status": "completed",
+  "model": "gpt-5.5",
+  "output": [{
+    "id": "msg_...",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "2+2 equals 4.", "annotations": []}]
+  }],
+  "output_text": "2+2 equals 4.",
+  "usage": {"input_tokens": 5, "output_tokens": 8, "total_tokens": 13}
+}
+```
+
+### Example (with instructions and input items)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "instructions": "You are a concise assistant.",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Explain recursion"}]}],
+    "stream": true
+  }'
+```
+
+### Streaming Events
+
+The streaming endpoint emits typed SSE events:
+
+| Event | Description |
+|-------|-------------|
+| `response.created` | Response object created (status: in_progress) |
+| `response.in_progress` | Response is being generated |
+| `response.output_item.added` | New output item added (message, reasoning, or function_call) |
+| `response.content_part.added` | Content part added to message item |
+| `response.output_text.delta` | Text delta |
+| `response.output_text.done` | Text complete |
+| `response.content_part.done` | Content part complete |
+| `response.output_item.done` | Output item complete |
+| `response.reasoning_summary_text.delta` | Reasoning/thinking delta |
+| `response.reasoning_summary_text.done` | Reasoning complete |
+| `response.function_call_arguments.delta` | Tool call arguments delta |
+| `response.function_call_arguments.done` | Tool call arguments complete |
+| `response.completed` | Full response object (status: completed) |
+| `response.failed` | Error occurred (status: failed) |
 
 ## Project Structure
 

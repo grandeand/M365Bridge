@@ -430,6 +430,7 @@ print(resp.choices[0].message.content)
 |-----------------------------|---------------------------------------------------|
 | `POST /v1/chat/completions` | OpenAI Chat Completions (akışlı + akışsız)        |
 | `POST /v1/completions`      | OpenAI metin tamamlama (akışlı + akışsız)         |
+| `POST /v1/responses`        | OpenAI Responses API (akışlı + akışsız)           |
 | `POST /v1/messages`         | Anthropic Messages formatı (özel SSE işleyiciler) |
 | `POST /v1/complete`         | Anthropic Complete (FIM)                          |
 | `GET /v1/models`            | Model listesi                                     |
@@ -582,6 +583,79 @@ Yanıt:
 - M365 Copilot kendi sunucu tarafı araçlarını çalıştırdığında (web araması, code interpreter) ve simüle JSON yerine düz metin döndürdüğünde, yanıt normal bir metin tamamlaması olarak `finish_reason: "stop"` ile döndürülür.
 - Konuşma geçmişindeki `tool_result` mesajları (OpenAI) ve `tool_use`/`tool_result` içerik blokları (Anthropic), M365 backend'i tool rollerini anlamadığı için M365'ye gönderilmeden önce düz metne dönüştürülür.
 - Streaming endpoint'leri, tool call'ları ayrıştırmadan önce tam yanıtı tampona alır (tool call JSON'u birden çok chunk'a yayılabilir).
+
+## Responses API
+
+`/v1/responses` uç noktası, OpenAI Responses API formatını uygular. `input` (string veya tipli öğe dizisi), `instructions`, `max_output_tokens`, `tools` ve konuşma sürekliliği için `previous_response_id` kabul eder.
+
+### Örnek (akışsız)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5",
+    "input": "2+2 kaçtır?",
+    "session_id": "my-session"
+  }'
+```
+
+Yanıt:
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "created_at": 1234567890,
+  "status": "completed",
+  "model": "gpt-5.5",
+  "output": [{
+    "id": "msg_...",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "2+2 eşittir 4.", "annotations": []}]
+  }],
+  "output_text": "2+2 eşittir 4.",
+  "usage": {"input_tokens": 5, "output_tokens": 8, "total_tokens": 13}
+}
+```
+
+### Örnek (instructions ve input öğeleri ile)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "instructions": "Kısa ve öz bir asistansın.",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Rekürsiyonu açıkla"}]}],
+    "stream": true
+  }'
+```
+
+### Streaming Olayları
+
+Streaming uç noktası tipli SSE olayları yayınlar:
+
+| Olay | Açıklama |
+|------|----------|
+| `response.created` | Response nesnesi oluşturuldu (status: in_progress) |
+| `response.in_progress` | Response üretiliyor |
+| `response.output_item.added` | Yeni output öğesi eklendi (message, reasoning veya function_call) |
+| `response.content_part.added` | İçerik parçası message öğesine eklendi |
+| `response.output_text.delta` | Metin deltası |
+| `response.output_text.done` | Metin tamamlandı |
+| `response.content_part.done` | İçerik parçası tamamlandı |
+| `response.output_item.done` | Output öğesi tamamlandı |
+| `response.reasoning_summary_text.delta` | Reasoning/düşünme deltası |
+| `response.reasoning_summary_text.done` | Reasoning tamamlandı |
+| `response.function_call_arguments.delta` | Tool call argüman deltası |
+| `response.function_call_arguments.done` | Tool call argümanları tamamlandı |
+| `response.completed` | Tam response nesnesi (status: completed) |
+| `response.failed` | Hata oluştu (status: failed) |
 
 ## Proje Yapısı
 
