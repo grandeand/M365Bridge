@@ -5,6 +5,22 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-07
+
+### Added
+- Structured logging system (`pkg/logging`) with dual-writer (stdout + `data/proxy.log`) and leveled logging (DEBUG/INFO/WARN/ERROR/FATAL)
+- OpenAI Images API endpoints (`/v1/images/generations`, `/v1/images/edits`) wrapping M365 DALL-E image generation
+- Image generation support with server-side image download for both `url` and `b64_json` response formats
+- Multiple image upload support for image edits (up to 16 images via repeated `image` form fields)
+- OpenAI Responses API endpoint (`/v1/responses`)
+- Generated image URL extraction from M365 WebSocket responses with markdown image link emission
+
+### Fixed
+- Client: extract generated image URLs from M365 WebSocket Progress messages (`contentOrigin: "ImageGeneration"`)
+
+### Changed
+- Documentation: fix model table formatting
+
 ## [1.1.0] - 2026-07-06
 
 ### Added
