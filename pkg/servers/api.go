@@ -159,7 +159,7 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
 	mux.HandleFunc("/v1/images/edits", api.withAuth(api.handleImageEdits))
-	mux.HandleFunc("/v1/models", api.withAuth(api.handleModels))
+	mux.HandleFunc("/v1/models", api.handleModels)
 	mux.HandleFunc("/health", api.handleHealth)
 
 	api.server = &http.Server{
