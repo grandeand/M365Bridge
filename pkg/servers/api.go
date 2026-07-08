@@ -670,6 +670,15 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 		convID = api.ctxCache.Get("session:" + sid)
 	}
 
+	if req.Stream {
+		api.streamAnthropicComplete(w, messages, cfg, req.Model, req.MaxTokensToSample, req.StopSequences, sid, convID)
+	} else {
+		api.nonStreamAnthropicComplete(w, messages, cfg, req.Model, req.MaxTokensToSample, req.StopSequences, sid, convID)
+	}
+}
+
+// nonStreamAnthropicComplete handles non-streaming Anthropic complete (FIM) requests.
+func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
 	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
@@ -677,7 +686,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	}
 
 	stopReason := "end_turn"
-	for _, s := range req.StopSequences {
+	for _, s := range stopSequences {
 		if strings.Contains(respText, s) {
 			stopReason = "stop_sequence"
 			break
@@ -685,8 +694,8 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	}
 
 	// Enforce max_tokens_to_sample on response text
-	if req.MaxTokensToSample > 0 {
-		if truncated, ok := truncateToTokens(respText, req.MaxTokensToSample); ok {
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
 			respText = truncated
 			stopReason = "max_tokens"
 		}
@@ -695,12 +704,120 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	response := map[string]interface{}{
 		"completion":  respText,
 		"stop_reason": stopReason,
-		"model":       req.Model,
+		"model":       model,
 		"stop":        nil,
 		"log_id":      fmt.Sprintf("cmpl_%s", uuid.New().String()),
 	}
 
 	api.sendJSON(w, http.StatusOK, response)
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if convID := api.m365Client.LastConversationID(); convID != "" {
+			api.ctxCache.Set("session:"+sid, convID)
+		}
+	}
+}
+
+// streamAnthropicComplete streams Anthropic complete (FIM) responses.
+// Anthropic Complete streaming uses SSE with event: completion and
+// data containing {"type":"completion","completion":"<delta>","stop_reason":null}.
+// The final event has stop_reason set and completion empty.
+func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return
+	}
+
+	logID := fmt.Sprintf("cmpl_%s", uuid.New().String())
+
+	// Send ping event (Anthropic streaming starts with ping)
+	pingData := map[string]interface{}{"type": "ping"}
+	pingJSON, _ := json.Marshal(pingData)
+	fmt.Fprintf(w, "event: ping\ndata: %s\n\n", pingJSON)
+	flusher.Flush()
+
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+
+	fullText := ""
+	thinkingText := ""
+	truncated := false
+
+	for chunk := range ch {
+		if chunk.Error != nil {
+			errData := map[string]interface{}{
+				"type":    "error",
+				"error":   map[string]interface{}{"type": "server_error", "message": chunk.Error.Error()},
+			}
+			errJSON, _ := json.Marshal(errData)
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
+			flusher.Flush()
+			return
+		}
+
+		if chunk.IsFinal {
+			break
+		}
+
+		// Accumulate thinking (not sent as content for Complete API)
+		if chunk.Thinking != "" {
+			thinkingText += chunk.Thinking
+			continue
+		}
+
+		// Check max_tokens limit
+		if maxTokens > 0 && countTokens(fullText) >= maxTokens {
+			truncated = true
+			for range ch {
+			}
+			break
+		}
+
+		fullText += chunk.Text
+
+		// Send completion event with delta text
+		compData := map[string]interface{}{
+			"type":        "completion",
+			"completion":  chunk.Text,
+			"stop_reason": nil,
+			"model":       model,
+			"log_id":      logID,
+		}
+		compJSON, _ := json.Marshal(compData)
+		fmt.Fprintf(w, "event: completion\ndata: %s\n\n", compJSON)
+		flusher.Flush()
+	}
+
+	// Determine stop reason
+	stopReason := "end_turn"
+	for _, s := range stopSequences {
+		if strings.Contains(fullText, s) {
+			stopReason = "stop_sequence"
+			break
+		}
+	}
+	if truncated {
+		stopReason = "max_tokens"
+	}
+
+	// Send final completion event with stop_reason
+	finalData := map[string]interface{}{
+		"type":        "completion",
+		"completion":  "",
+		"stop_reason": stopReason,
+		"model":       model,
+		"stop":        nil,
+		"log_id":      logID,
+	}
+	finalJSON, _ := json.Marshal(finalData)
+	fmt.Fprintf(w, "event: completion\ndata: %s\n\n", finalJSON)
+	flusher.Flush()
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
