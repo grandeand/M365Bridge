@@ -5,6 +5,24 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-07-08
+
+### Added
+- Tool calling support for `/v1/completions` endpoint (simulated tool calls with `tools` field)
+- Streaming support for `/v1/complete` endpoint (SSE events: `ping`, `completion` with delta text, final `completion` with `stop_reason`)
+
+### Changed
+- Consolidate `StreamChunk` and `ConversationStreamChunk` into a single `StreamChunk` type
+- Consolidate `ChatStreamGen` to delegate to `ChatConversationStreamGen` (eliminates ~150 lines of duplicated WebSocket read loop logic)
+- Remove shared state from `M365Client` for concurrent requests (per-request state via channel chunks, no mutex needed)
+- `ChatConversation` now returns 6 values (added `conversationID` return value)
+- `LastConversationID()`, `LastToolCalls()`, `LastThinking()` methods removed from `M365Client`
+- CI: use CHANGELOG.md content for GitHub release body
+
+### Fixed
+- Make `/v1/models` endpoint public without auth requirement
+- Merge system prompts into last message for M365 backend (system messages in earlier positions were silently dropped in multi-message conversations)
+
 ## [1.2.1] - 2026-07-07
 
 ### Added
