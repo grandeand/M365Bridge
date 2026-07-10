@@ -2160,6 +2160,7 @@ func toolChoiceString(toolChoice interface{}) string {
 }
 
 const simulatedToolCallRequiredCode = "simulated_tool_call_required"
+const upstreamEmptyResponseCode = "upstream_empty_response"
 
 var errSimulatedToolCallRequired = errors.New(simulatedToolCallRequiredCode)
 
@@ -2485,8 +2486,11 @@ func responsesReasoningForOutput(thinking string, simulated bool) string {
 	return thinking
 }
 
-func writeResponsesSimulationError(w http.ResponseWriter, stream bool, responseID, model string, err error) {
-	message := err.Error()
+func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
+	return strings.TrimSpace(text) == "" && len(toolCalls) == 0
+}
+
+func writeResponsesServerError(w http.ResponseWriter, stream bool, responseID, model, code, message string) {
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		event := map[string]interface{}{
@@ -2499,7 +2503,7 @@ func writeResponsesSimulationError(w http.ResponseWriter, stream bool, responseI
 				"error": map[string]interface{}{
 					"message": message,
 					"type":    "server_error",
-					"code":    simulatedToolCallRequiredCode,
+					"code":    code,
 				},
 			},
 		}
@@ -2519,9 +2523,31 @@ func writeResponsesSimulationError(w http.ResponseWriter, stream bool, responseI
 		"error": map[string]interface{}{
 			"message": message,
 			"type":    "server_error",
-			"code":    simulatedToolCallRequiredCode,
+			"code":    code,
 		},
 	})
+}
+
+func writeResponsesSimulationError(w http.ResponseWriter, stream bool, responseID, model string, err error) {
+	writeResponsesServerError(
+		w,
+		stream,
+		responseID,
+		model,
+		simulatedToolCallRequiredCode,
+		err.Error(),
+	)
+}
+
+func writeResponsesUpstreamEmptyError(w http.ResponseWriter, stream bool, responseID, model string) {
+	writeResponsesServerError(
+		w,
+		stream,
+		responseID,
+		model,
+		upstreamEmptyResponseCode,
+		"M365 returned an empty response; the upstream service may be throttling this account",
+	)
 }
 
 // parseModelSessionID splits a model string of the form "modelKey:sessionID"
@@ -2977,6 +3003,18 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 		finishReason = simulated.finishReason
 	}
 	thinking = responsesReasoningForOutput(thinking, toolPolicy.simulate)
+	if responsesResultEmpty(respText, toolCalls) {
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
+		writeResponsesUpstreamEmptyError(
+			w,
+			false,
+			"",
+			cfg.OpenAIID,
+		)
+		return
+	}
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
@@ -3204,6 +3242,19 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	}
 	_ = finalToolCalls
 
+	if !toolCallingEnabled && responsesResultEmpty(fullText, finalToolCalls) {
+		if sid != "" {
+			api.ctxCache.Delete("session:" + sid)
+		}
+		writeResponsesUpstreamEmptyError(
+			w,
+			true,
+			responseID,
+			openaiModel,
+		)
+		return
+	}
+
 	// Finalize reasoning item if emitted
 	if reasoningItemEmitted && !toolCallingEnabled {
 		sendEvent("response.reasoning_summary_text.done", map[string]interface{}{
@@ -3249,6 +3300,18 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		fullText = simulated.content
 		toolCalls = simulated.toolCalls
 		finishReason = simulated.finishReason
+		if responsesResultEmpty(fullText, toolCalls) {
+			if sid != "" {
+				api.ctxCache.Delete("session:" + sid)
+			}
+			writeResponsesUpstreamEmptyError(
+				w,
+				true,
+				responseID,
+				openaiModel,
+			)
+			return
+		}
 
 		// Now emit the buffered text and tool calls as Responses events
 		outputIdx := 0

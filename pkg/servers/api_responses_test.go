@@ -606,6 +606,62 @@ func TestWriteResponsesSimulationErrorStreaming(t *testing.T) {
 	}
 }
 
+func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
+	call := client.ToolCall{ID: "call_test"}
+	tests := []struct {
+		name  string
+		text  string
+		calls []client.ToolCall
+		empty bool
+	}{
+		{name: "empty", empty: true},
+		{name: "content", text: "ok"},
+		{name: "tool call", calls: []client.ToolCall{call}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := responsesResultEmpty(tt.text, tt.calls); got != tt.empty {
+				t.Fatalf("responsesResultEmpty = %v, want %v", got, tt.empty)
+			}
+		})
+	}
+}
+
+func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	writeResponsesUpstreamEmptyError(rec, false, "resp_test", "gpt-test")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON body: %v", err)
+	}
+	errorObject, _ := body["error"].(map[string]interface{})
+	if errorObject["code"] != upstreamEmptyResponseCode {
+		t.Fatalf("error code = %#v, want %q", errorObject["code"], upstreamEmptyResponseCode)
+	}
+}
+
+func TestWriteResponsesUpstreamEmptyErrorStreaming(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	writeResponsesUpstreamEmptyError(rec, true, "resp_test", "gpt-test")
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"type":"response.failed"`) {
+		t.Fatalf("stream missing response.failed event:\n%s", body)
+	}
+	if !strings.Contains(body, `"code":"`+upstreamEmptyResponseCode+`"`) {
+		t.Fatalf("stream missing stable error code:\n%s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("stream missing terminal marker:\n%s", body)
+	}
+}
+
 func simulatedToolCallEnvelope(name string) string {
 	return "```json\n" +
 		`{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_test","type":"function","function":{"name":"` +
