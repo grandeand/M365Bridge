@@ -374,6 +374,32 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T) {
+	messages := responsesInputToMessages([]interface{}{
+		map[string]interface{}{
+			"type":    "function_call_output",
+			"call_id": "call_nonce",
+			"output":  "NONCE-EXACT",
+		},
+	})
+
+	if len(messages) != 1 {
+		t.Fatalf("message count = %d", len(messages))
+	}
+	if messages[0].Role != "user" {
+		t.Fatalf("function result role = %q, want user", messages[0].Role)
+	}
+	for _, expected := range []string{
+		"authoritative tool result",
+		"call_nonce",
+		"NONCE-EXACT",
+	} {
+		if !strings.Contains(strings.ToLower(messages[0].Content), strings.ToLower(expected)) {
+			t.Fatalf("function result lost %q: %s", expected, messages[0].Content)
+		}
+	}
+}
+
 func TestResponsesInputPreservesNamespacedToolState(t *testing.T) {
 	namespacedTools := []interface{}{
 		map[string]interface{}{

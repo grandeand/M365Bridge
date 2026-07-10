@@ -2750,10 +2750,17 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 		if itemType == "function_call_output" {
 			callID, _ := m["call_id"].(string)
 			output, _ := m["output"].(string)
+			if output == "" && m["output"] != nil {
+				encoded, _ := json.Marshal(m["output"])
+				output = string(encoded)
+			}
 			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: output,
-				Name:    callID,
+				Role: "user",
+				Content: fmt.Sprintf(
+					"Authoritative tool result (call_id: %s):\n%s",
+					callID,
+					output,
+				),
 			})
 			continue
 		}
