@@ -157,6 +157,7 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
 	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.handleResponsesCompact))
 	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
+	mux.HandleFunc("/v1/messages/count_tokens", api.withAuth(api.handleAnthropicCountTokens))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
 	mux.HandleFunc("/v1/images/edits", api.withAuth(api.handleImageEdits))
@@ -590,6 +591,48 @@ func normalizeAnthropicSystem(raw json.RawMessage) (string, error) {
 	}
 
 	return strings.Join(parts, "\n\n"), nil
+}
+
+// handleAnthropicCountTokens handles Anthropic token counting requests.
+func (api *APIServer) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req struct {
+		System   json.RawMessage `json:"system"`
+		Messages json.RawMessage `json:"messages"`
+		Tools    json.RawMessage `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if len(req.Messages) == 0 || string(req.Messages) == "null" {
+		api.sendError(w, http.StatusBadRequest, "messages is required")
+		return
+	}
+
+	countable, err := json.Marshal(struct {
+		System   json.RawMessage `json:"system,omitempty"`
+		Messages json.RawMessage `json:"messages"`
+		Tools    json.RawMessage `json:"tools,omitempty"`
+	}{
+		System:   req.System,
+		Messages: req.Messages,
+		Tools:    req.Tools,
+	})
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid token input: %v", err))
+		return
+	}
+
+	api.sendJSON(w, http.StatusOK, map[string]int{"input_tokens": countTokens(string(countable))})
 }
 
 // handleAnthropicMessages handles Anthropic messages API requests.

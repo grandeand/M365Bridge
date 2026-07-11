@@ -472,6 +472,7 @@ print(resp.choices[0].message.content)
 | `POST /v1/responses`          | OpenAI Responses API (akışlı + akışsız)           |
 | `POST /v1/responses/compact`  | OpenAI Responses Compact API (Codex uzaktan sıkıştırma) |
 | `POST /v1/messages`           | Anthropic Messages formatı (özel SSE işleyiciler) |
+| `POST /v1/messages/count_tokens` | Anthropic girdi token'larını sayar              |
 | `POST /v1/complete`           | Anthropic Complete (FIM)                          |
 | `POST /v1/images/generations` | OpenAI Images API: metinden üret (JSON body)      |
 | `POST /v1/images/edits`       | OpenAI Images API: görseli düzenle (multipart)    |

@@ -472,6 +472,7 @@ print(resp.choices[0].message.content)
 | `POST /v1/responses`          | OpenAI Responses API (streaming + non-streaming)    |
 | `POST /v1/responses/compact`  | OpenAI Responses Compact API (Codex remote compaction) |
 | `POST /v1/messages`           | Anthropic Messages format (dedicated SSE handlers)  |
+| `POST /v1/messages/count_tokens` | Anthropic input token counting                   |
 | `POST /v1/complete`           | Anthropic Complete (FIM)                            |
 | `POST /v1/images/generations` | OpenAI Images API: generate from text (JSON body)   |
 | `POST /v1/images/edits`       | OpenAI Images API: edit existing image (multipart)  |
