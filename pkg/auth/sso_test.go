@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -76,6 +77,35 @@ func TestAcquireDesignerTokenDoesNotReacquireTransientFailure(t *testing.T) {
 	}
 }
 
+func TestM365CookieHeaderFiltersCookiesByDomain(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	writeM365Cookies(t, []SSOCookie{
+		{Name: "ESTSAUTH", Value: "login-secret", Domain: "login.microsoftonline.com"},
+		{Name: "M365Session", Value: "m365-secret", Domain: ".m365.cloud.microsoft"},
+		{Name: "Empty", Value: "", Domain: "m365.cloud.microsoft"},
+	})
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	header, err := tm.M365CookieHeader()
+	if err != nil {
+		t.Fatalf("build M365 cookie header: %v", err)
+	}
+	if header != "M365Session=m365-secret" {
+		t.Fatalf("unexpected M365 cookie header: %q", header)
+	}
+}
+
+func TestM365CookieHeaderRequiresM365DomainCookie(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	writeM365Cookies(t, []SSOCookie{{Name: "ESTSAUTH", Value: "secret", Domain: "login.microsoftonline.com"}})
+
+	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")
+	_, err := tm.M365CookieHeader()
+	if !errors.Is(err, ErrM365CookiesUnavailable) {
+		t.Fatalf("expected M365 cookies unavailable, got %v", err)
+	}
+}
+
 func TestSummarizeBrokerAuthorizeResponsePrefersAADSTSError(t *testing.T) {
 	body := `<!DOCTYPE html><html><head><title>Something went wrong</title></head><body>
 <p>AADSTS50011: The reply URL specified in the request does not match the reply URLs configured for the application.</p>
@@ -94,6 +124,23 @@ func TestSummarizeBrokerAuthorizeResponseUsesTitleFallback(t *testing.T) {
 	summary := summarizeBrokerAuthorizeResponse("<html><head><title>Something went wrong</title></head><body></body></html>")
 	if summary != "page title: Something went wrong" {
 		t.Fatalf("unexpected fallback summary: %q", summary)
+	}
+}
+
+func writeM365Cookies(t *testing.T, cookies []SSOCookie) {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{
+		"domain":  "m365.cloud.microsoft",
+		"cookies": cookies,
+	})
+	if err != nil {
+		t.Fatalf("marshal M365 cookies: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(m365CookiesFile), 0700); err != nil {
+		t.Fatalf("create M365 cookie directory: %v", err)
+	}
+	if err := os.WriteFile(m365CookiesFile, data, 0600); err != nil {
+		t.Fatalf("write M365 cookies: %v", err)
 	}
 }
 

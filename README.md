@@ -476,6 +476,10 @@ print(resp.choices[0].message.content)
 | `POST /v1/complete`           | Anthropic Complete (FIM)                            |
 | `POST /v1/images/generations` | OpenAI Images API: generate from text (JSON body)   |
 | `POST /v1/images/edits`       | OpenAI Images API: edit existing image (multipart)  |
+| `GET /v1/conversations`       | List M365 conversations (requires M365 web cookies) |
+| `POST /v1/conversations`      | Create a conversation with an initial message       |
+| `PATCH /v1/conversations/{id}` | Rename a conversation with `{ "name": "..." }`  |
+| `DELETE /v1/conversations/{id}` | Permanently delete a conversation                  |
 | `GET /v1/models`              | Model list                                          |
 | `GET /health`                 | Health check (no auth required)                     |
 

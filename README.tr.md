@@ -476,6 +476,10 @@ print(resp.choices[0].message.content)
 | `POST /v1/complete`           | Anthropic Complete (FIM)                          |
 | `POST /v1/images/generations` | OpenAI Images API: metinden üret (JSON body)      |
 | `POST /v1/images/edits`       | OpenAI Images API: görseli düzenle (multipart)    |
+| `GET /v1/conversations`       | M365 konuşmalarını listeler (M365 web cookies gerekir) |
+| `POST /v1/conversations`      | İlk mesajla yeni bir konuşma oluşturur           |
+| `PATCH /v1/conversations/{id}` | Konuşmayı `{ "name": "..." }` ile yeniden adlandırır |
+| `DELETE /v1/conversations/{id}` | Konuşmayı kalıcı olarak siler                    |
 | `GET /v1/models`              | Model listesi                                     |
 | `GET /health`                 | Sağlık kontrolü (kimlik doğrulama gerektirmez)    |
 

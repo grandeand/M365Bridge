@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -161,6 +162,8 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
 	mux.HandleFunc("/v1/images/edits", api.withAuth(api.handleImageEdits))
+	mux.HandleFunc("/v1/conversations", api.withAuth(api.handleConversations))
+	mux.HandleFunc("/v1/conversations/", api.withAuth(api.handleConversation))
 	mux.HandleFunc("/v1/models", api.handleModels)
 	mux.HandleFunc("/health", api.handleHealth)
 
@@ -305,10 +308,126 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 	api.sendJSON(w, http.StatusOK, response)
 }
 
+// handleConversations lists or creates M365 conversations.
+func (api *APIServer) handleConversations(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	if r.Method == http.MethodPost {
+		api.createConversation(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	conversationClient := client.NewConversationClient(api.tokenManager)
+	conversations, err := conversationClient.ListConversations(r.Context())
+	if err != nil {
+		api.sendConversationError(w, err)
+		return
+	}
+	api.sendJSON(w, http.StatusOK, map[string]any{"conversations": conversations})
+}
+
+func (api *APIServer) createConversation(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Message   string `json:"message"`
+		Name      string `json:"name"`
+		Model     string `json:"model"`
+		SessionID string `json:"session_id,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		api.sendError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		api.sendError(w, http.StatusBadRequest, "message is required")
+		return
+	}
+	if req.Model == "" {
+		req.Model = "gpt5.5-reasoning"
+	}
+	cfg := models.LookupModel(req.Model)
+	messages := []payload.Message{{Role: "user", Content: req.Message}}
+	_, _, _, _, conversationID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, false)
+	if err != nil {
+		api.sendError(w, http.StatusBadGateway, "M365 conversation creation failed")
+		return
+	}
+	if conversationID == "" {
+		api.sendError(w, http.StatusBadGateway, "M365 conversation creation returned no conversation ID")
+		return
+	}
+	if strings.TrimSpace(req.Name) != "" {
+		conversationClient := client.NewConversationClient(api.tokenManager)
+		if err := conversationClient.RenameConversation(r.Context(), conversationID, strings.TrimSpace(req.Name)); err != nil {
+			api.sendConversationError(w, err)
+			return
+		}
+	}
+	api.sendJSON(w, http.StatusCreated, map[string]any{"id": conversationID, "name": req.Name})
+}
+
+// handleConversation renames or permanently deletes one M365 conversation.
+func (api *APIServer) handleConversation(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return
+	}
+	conversationID := strings.TrimPrefix(r.URL.Path, "/v1/conversations/")
+	if conversationID == "" || strings.Contains(conversationID, "/") {
+		api.sendError(w, http.StatusNotFound, "Conversation not found")
+		return
+	}
+	conversationClient := client.NewConversationClient(api.tokenManager)
+	switch r.Method {
+	case http.MethodPatch:
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			api.sendError(w, http.StatusBadRequest, "Invalid request body")
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			api.sendError(w, http.StatusBadRequest, "name is required")
+			return
+		}
+		if err := conversationClient.RenameConversation(r.Context(), conversationID, strings.TrimSpace(req.Name)); err != nil {
+			api.sendConversationError(w, err)
+			return
+		}
+		api.sendJSON(w, http.StatusOK, map[string]any{"id": conversationID, "name": strings.TrimSpace(req.Name)})
+	case http.MethodDelete:
+		if err := conversationClient.DeleteConversation(r.Context(), conversationID); err != nil {
+			api.sendConversationError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+func (api *APIServer) sendConversationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, auth.ErrM365CookiesUnavailable):
+		api.sendError(w, http.StatusUnauthorized, "M365 web app cookies are not configured")
+	case errors.Is(err, client.ErrConversationAuthentication):
+		api.sendError(w, http.StatusUnauthorized, "M365 web app cookies are invalid or expired")
+	default:
+		logging.Errorf("Conversation management request failed: %v", err)
+		api.sendError(w, http.StatusBadGateway, "M365 conversation service request failed")
+	}
+}
+
 // handleCORS handles CORS preflight requests.
 func (api *APIServer) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id")
 	w.WriteHeader(http.StatusOK)
 }

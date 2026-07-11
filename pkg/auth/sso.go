@@ -27,13 +27,18 @@ import (
 const (
 	// ssoCookiesFile is the encrypted SSO cookie store.
 	ssoCookiesFile = "data/tokens/sso_cookies.json"
+	// m365CookiesFile is the browser-exported M365 web cookie store.
+	m365CookiesFile = "data/tokens/m365_cookies.json"
 	// authorizeURLTemplate is the OAuth2 authorize endpoint for silent re-auth.
 	authorizeURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize"
 	// defaultRedirectURI is the redirect URI registered for the M365 Copilot SPA app.
 	defaultRedirectURI = "https://m365.cloud.microsoft/spalanding"
 )
 
-// SSOCookie represents a single SSO cookie from login.microsoftonline.com.
+// ErrM365CookiesUnavailable indicates that no cookies for the M365 web app are stored.
+var ErrM365CookiesUnavailable = errors.New("M365 web app cookies unavailable")
+
+// SSOCookie represents a browser cookie used by M365 authentication or web APIs.
 type SSOCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
@@ -90,6 +95,31 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
 }
 
+// SaveM365Cookies stores browser cookies used by M365 web APIs.
+func SaveM365Cookies(cookies []SSOCookie) error {
+	store := struct {
+		Domain      string      `json:"domain"`
+		ExtractedAt time.Time   `json:"extracted_at"`
+		Cookies     []SSOCookie `json:"cookies"`
+	}{
+		Domain:      "m365.cloud.microsoft",
+		ExtractedAt: time.Now(),
+		Cookies:     cookies,
+	}
+
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(m365CookiesFile), 0700); err != nil {
+		return fmt.Errorf("failed to create M365 cookie directory: %w", err)
+	}
+	if err := os.WriteFile(m365CookiesFile, data, 0600); err != nil {
+		return fmt.Errorf("failed to save M365 cookies: %w", err)
+	}
+	return nil
+}
+
 // loadSSOCookies reads and decrypts SSO cookies from disk.
 func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
 	data, err := os.ReadFile(ssoCookiesFile)
@@ -114,6 +144,38 @@ func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
 func hasSSOCookies() bool {
 	_, err := os.Stat(ssoCookiesFile)
 	return err == nil
+}
+
+// M365CookieHeader returns cookies scoped to the M365 web application.
+func (tm *TokenManager) M365CookieHeader() (string, error) {
+	data, err := os.ReadFile(m365CookiesFile)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
+	}
+
+	var store struct {
+		Cookies []SSOCookie `json:"cookies"`
+	}
+	if err := json.Unmarshal(data, &store); err != nil {
+		return "", fmt.Errorf("%w: failed to parse M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	}
+
+	var cookieParts []string
+	for _, cookie := range store.Cookies {
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
+			continue
+		}
+		if cookie.Name == "" || cookie.Value == "" {
+			continue
+		}
+		cookieParts = append(cookieParts, cookie.Name+"="+cookie.Value)
+	}
+	if len(cookieParts) == 0 {
+		return "", ErrM365CookiesUnavailable
+	}
+
+	return strings.Join(cookieParts, "; "), nil
 }
 
 // reauthWithSSO performs silent re-authentication using stored SSO cookies.

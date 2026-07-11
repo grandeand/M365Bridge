@@ -49,12 +49,22 @@ func Run(filePath string) error {
 		return fmt.Errorf("%w\n\nSave the browser console JSON output to %s and try again", err, filePath)
 	}
 
-	// Step 2: Save SSO cookies if provided (before verify, so SSO fallback works)
+	// Step 2: Save cookies by authentication surface before token verification.
 	if len(ssoCookies) > 0 {
-		if err := auth.SaveSSOCookies(ssoCookies); err != nil {
-			fmt.Printf("  Warning: failed to save SSO cookies: %v\n", err)
-		} else {
-			fmt.Println("  SSO cookies encrypted and saved")
+		loginCookies, m365Cookies := splitCookiesByDomain(ssoCookies)
+		if len(loginCookies) > 0 {
+			if err := auth.SaveSSOCookies(loginCookies); err != nil {
+				fmt.Printf("  Warning: failed to save SSO cookies: %v\n", err)
+			} else {
+				fmt.Println("  SSO cookies encrypted and saved")
+			}
+		}
+		if len(m365Cookies) > 0 {
+			if err := auth.SaveM365Cookies(m365Cookies); err != nil {
+				fmt.Printf("  Warning: failed to save M365 web cookies: %v\n", err)
+			} else {
+				fmt.Println("  M365 web cookies saved")
+			}
 		}
 	}
 
@@ -182,32 +192,42 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 	fmt.Println("  Save the JSON output to data/setup.json (or pass --file <path>)")
 	fmt.Println()
 
-	// SSO cookie instructions for auto-renewal
+	// Browser cookie instructions for auto-renewal and conversation management.
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("  Step 2 (Optional): Capture SSO cookies for auto-renewal")
+	fmt.Println("  Step 2 (Optional): Capture browser cookies")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println()
-	fmt.Println("  SSO cookies allow the server to auto-renew tokens after the")
-	fmt.Println("  24-hour refresh token expiry, without running setup-wizard again.")
-	fmt.Println("  SSO cookies last weeks/months.")
+	fmt.Println("  Login cookies enable token auto-renewal after the 24-hour refresh")
+	fmt.Println("  token expiry. M365 web app cookies enable conversation management.")
+	fmt.Println("  Capture cookies from both domains in DevTools -> Application -> Cookies:")
+	fmt.Println("    - https://login.microsoftonline.com")
+	fmt.Println("    - https://m365.cloud.microsoft")
+	fmt.Println("  Add each cookie to data/setup.json with its domain:")
 	fmt.Println()
-	fmt.Println("  SSO cookies are on login.microsoftonline.com, NOT m365.cloud.microsoft.")
-	fmt.Println("  Open https://login.microsoftonline.com in your browser first, then:")
-	fmt.Println("    1. Press F12, go to Application -> Cookies -> https://login.microsoftonline.com")
-	fmt.Println("    2. Find these cookies and copy their values:")
-	fmt.Println("       - ESTSAUTH")
-	fmt.Println("       - ESTSAUTHPERSISTENT")
-	fmt.Println("    3. Add them to data/setup.json under \"sso_cookies\" array:")
-	fmt.Println()
-	fmt.Println("  Example setup.json with SSO cookies:")
 	fmt.Println("  {")
 	fmt.Println("    \"oid\": \"...\", \"tenant\": \"...\", \"refresh_token\": \"...\",")
 	fmt.Println("    \"sso_cookies\": [")
-	fmt.Println("      {\"name\": \"ESTSAUTH\", \"value\": \"...\"},")
-	fmt.Println("      {\"name\": \"ESTSAUTHPERSISTENT\", \"value\": \"...\"}")
+	fmt.Println("      {\"name\": \"ESTSAUTH\", \"value\": \"...\", \"domain\": \"login.microsoftonline.com\"},")
+	fmt.Println("      {\"name\": \"<m365-cookie-name>\", \"value\": \"...\", \"domain\": \"m365.cloud.microsoft\"}")
 	fmt.Println("    ]")
 	fmt.Println("  }")
 	fmt.Println()
+}
+
+// splitCookiesByDomain separates login cookies from M365 web cookies.
+func splitCookiesByDomain(cookies []auth.SSOCookie) ([]auth.SSOCookie, []auth.SSOCookie) {
+	var loginCookies []auth.SSOCookie
+	var m365Cookies []auth.SSOCookie
+	for _, cookie := range cookies {
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		switch domain {
+		case "login.microsoftonline.com":
+			loginCookies = append(loginCookies, cookie)
+		case "m365.cloud.microsoft", "microsoft.com":
+			m365Cookies = append(m365Cookies, cookie)
+		}
+	}
+	return loginCookies, m365Cookies
 }
 
 // getConfigFromFile reads setup JSON from a file.
@@ -252,7 +272,7 @@ func getConfigFromFile(path string) (string, string, string, []auth.SSOCookie, e
 	// If refresh_token is a JSON object, try extracting secret/value/data fields
 	// If none found, use the entire JSON string as-is
 	refreshToken := parsed.RefreshToken
-	var rtObj map[string]interface{}
+	var rtObj map[string]any
 	if err := json.Unmarshal([]byte(refreshToken), &rtObj); err == nil {
 		if secret, ok := rtObj["secret"].(string); ok && secret != "" {
 			refreshToken = secret
