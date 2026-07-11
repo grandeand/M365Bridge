@@ -3253,7 +3253,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		api.sendError(w, http.StatusBadRequest, "prompt is required")
 		return
 	}
-	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s sid=%s", req.Model, req.N, req.Size, req.ResponseFormat, req.SessionID)
+	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s", req.Model, req.N, req.Size, req.ResponseFormat)
 	if req.N <= 0 {
 		req.N = 1
 	}
@@ -3266,46 +3266,21 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	if modelKey == "" {
 		modelKey = "gpt5.5-reasoning"
 	}
-	modelKey, modelSessionID := parseModelSessionID(modelKey)
+	modelKey, _ = parseModelSessionID(modelKey)
 	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
 
-	// Resolve session ID
-	sid := modelSessionID
-	if sid == "" {
-		sid = req.SessionID
-	}
-	if sid == "" {
-		sid = req.User
-	}
-	if sid == "" {
-		sid = r.Header.Get("X-Session-Id")
-	}
-	if sid == "" {
-		sid = "img-" + uuid.New().String()[:8]
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get("session:" + sid)
-	}
-
 	messages := []payload.Message{{Role: "user", Content: fullPrompt}}
 
-	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	// Image generation is a one-shot operation. Reusing a chat conversation can
+	// cause M365 to disengage instead of routing the prompt to image generation.
+	respText, _, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image generation failed: %v", err))
 		return
-	}
-
-	// Cache conversation ID
-	if sid != "" {
-		if finalConvID != "" {
-			api.ctxCache.Set("session:"+sid, finalConvID)
-		}
 	}
 
 	// Extract image URLs from markdown in response text
