@@ -4,7 +4,9 @@ package models
 
 import (
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
@@ -88,11 +90,18 @@ var ToolMessageType = map[string]string{
 
 // Config holds environment-based configuration.
 type Config struct {
-	TenantID        string
-	UserOID         string
-	ClientID        string
-	Scope           string
-	APIKeys         []string
+	TenantID              string
+	UserOID               string
+	ClientID              string
+	Scope                 string
+	APIKeys               []string
+	EnableCodeTools       bool
+	AutoExposeTools       bool
+	WorkspaceDir          string
+	CodeToolTimeout       time.Duration
+	CodeToolMaxOutput     int64
+	CodeToolMaxReadBytes  int64
+	CodeToolMaxIterations int
 }
 
 // LoadConfig loads configuration from .env file and environment variables.
@@ -102,11 +111,18 @@ func LoadConfig() *Config {
 	loadDotEnv()
 
 	cfg := &Config{
-		TenantID:        os.Getenv("M365_TENANT_ID"),
-		UserOID:         os.Getenv("M365_USER_OID"),
-		ClientID:        getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
-		Scope:           DefaultScope,
-		APIKeys:         parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
+		TenantID:              os.Getenv("M365_TENANT_ID"),
+		UserOID:               os.Getenv("M365_USER_OID"),
+		ClientID:              getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
+		Scope:                 DefaultScope,
+		APIKeys:               parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
+		EnableCodeTools:       getEnvBool("M365_ENABLE_CODE_TOOLS", false),
+		AutoExposeTools:       getEnvBool("M365_AUTO_EXPOSE_TOOLS", false),
+		WorkspaceDir:          getEnvWithDefault("M365_WORKSPACE_DIR", "."),
+		CodeToolTimeout:       getEnvDuration("M365_CODE_TOOL_TIMEOUT", 30*time.Second),
+		CodeToolMaxOutput:     getEnvInt64("M365_CODE_TOOL_MAX_OUTPUT", 1<<20),
+		CodeToolMaxReadBytes:  getEnvInt64("M365_CODE_TOOL_MAX_READ_BYTES", 1<<20),
+		CodeToolMaxIterations: getEnvInt("M365_CODE_TOOL_MAX_ITERATIONS", 10),
 	}
 
 	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d", cfg.TenantID, cfg.UserOID, cfg.ClientID[:min(8, len(cfg.ClientID))]+"...", len(cfg.APIKeys))
@@ -200,4 +216,40 @@ func getEnvBool(key string, defaultValue bool) bool {
 	default:
 		return defaultValue
 	}
+}
+
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
+}
+
+func getEnvInt64(key string, defaultValue int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }

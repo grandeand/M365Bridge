@@ -45,9 +45,13 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 			"NEVER emit a tool_calls entry with name \"code_interpreter\" or any name not present in the request's tools array.",
 			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
 		)
-		switch strings.ToLower(strings.TrimSpace(toolChoice)) {
+		normalizedChoice := strings.TrimSpace(toolChoice)
+		switch strings.ToLower(normalizedChoice) {
 		case "required":
 			lines = append(lines, "This request requires at least one tool call. Do not return a plain-text-only assistant response.")
+		case "", "auto", "none":
+		default:
+			lines = append(lines, fmt.Sprintf("This request requires a call to the tool named %q. Do not return a plain-text-only assistant response.", normalizedChoice))
 		}
 	}
 
@@ -97,10 +101,10 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 
 // SimulatedResult holds the parsed simulated response.
 type SimulatedResult struct {
-	Content      string      // assistant message content (empty if tool calls present)
-	ToolCalls    []ToolCall  // parsed tool calls
-	FinishReason string      // "tool_calls" or "stop"
-	HasPayload   bool        // true if a usable chat-completion payload was found
+	Content      string     // assistant message content (empty if tool calls present)
+	ToolCalls    []ToolCall // parsed tool calls
+	FinishReason string     // "tool_calls" or "stop"
+	HasPayload   bool       // true if a usable chat-completion payload was found
 }
 
 // ParseSimulatedResponse extracts a simulated OpenAI chat completion response

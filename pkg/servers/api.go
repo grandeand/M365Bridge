@@ -22,6 +22,7 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/codingtools"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
@@ -127,6 +128,7 @@ type APIServer struct {
 	config       *models.Config
 	tokenManager *auth.TokenManager
 	m365Client   *client.M365Client
+	codeTools    *codingtools.Manager
 	ctxCache     *ContextCache
 	server       *http.Server
 	stopCh       chan struct{}
@@ -148,8 +150,23 @@ const tokenRefreshInterval = 30 * time.Minute
 // Start starts the HTTP server on the specified port.
 func (api *APIServer) Start(port int) error {
 	api.mu.Lock()
-	// Initialize client
+	// Initialize request transports and optional local coding tools.
 	api.m365Client = client.NewM365Client(api.tokenManager)
+	if api.config.EnableCodeTools {
+		manager, err := codingtools.New(codingtools.Config{
+			Enabled:       true,
+			WorkspaceDir:  api.config.WorkspaceDir,
+			Timeout:       api.config.CodeToolTimeout,
+			MaxOutput:     api.config.CodeToolMaxOutput,
+			MaxReadBytes:  api.config.CodeToolMaxReadBytes,
+			MaxIterations: api.config.CodeToolMaxIterations,
+		})
+		if err != nil {
+			api.mu.Unlock()
+			return fmt.Errorf("initialize coding tools: %w", err)
+		}
+		api.codeTools = manager
+	}
 	api.stopCh = make(chan struct{})
 
 	mux := http.NewServeMux()
@@ -522,6 +539,143 @@ func (api *APIServer) hashSessionIDFromMessages(r *http.Request, messages []payl
 	return "h:" + hex.EncodeToString(h[:])
 }
 
+type toolLoopProvider int
+
+const (
+	toolLoopOpenAI toolLoopProvider = iota
+	toolLoopAnthropic
+)
+
+type toolLoopResult struct {
+	text           string
+	thinking       string
+	toolCalls      []client.ToolCall
+	finishReason   string
+	conversationID string
+}
+
+func (api *APIServer) prepareCodingTools(tools []toolcalling.ToolDef, anthropic bool) ([]toolcalling.ToolDef, map[string]bool) {
+	local := make(map[string]bool)
+	if api.codeTools == nil {
+		return tools, local
+	}
+	available := make(map[string]codingtools.Tool)
+	for _, schema := range api.codeTools.Tools() {
+		available[schema.Name] = schema
+	}
+	for _, definition := range tools {
+		name := toolcalling.ToolName(&definition)
+		if _, ok := available[name]; ok {
+			local[name] = true
+		}
+	}
+	if !api.config.AutoExposeTools {
+		return tools, local
+	}
+	seen := make(map[string]bool, len(tools))
+	for i := range tools {
+		seen[toolcalling.ToolName(&tools[i])] = true
+	}
+	for _, schema := range api.codeTools.Tools() {
+		local[schema.Name] = true
+		if seen[schema.Name] {
+			continue
+		}
+		definition := toolcalling.ToolDef{Name: schema.Name, Description: schema.Description, InputSchema: schema.InputSchema}
+		if !anthropic {
+			definition = toolcalling.ToolDef{Type: "function", Function: toolcalling.ToolDefFunc{Name: schema.Name, Description: schema.Description, Parameters: schema.InputSchema}}
+		}
+		tools = append(tools, definition)
+	}
+	return tools, local
+}
+
+func replaceRequestTools(body []byte, tools []toolcalling.ToolDef) string {
+	var request map[string]any
+	if json.Unmarshal(body, &request) != nil {
+		return string(body)
+	}
+	request["tools"] = tools
+	updated, err := json.Marshal(request)
+	if err != nil {
+		return string(body)
+	}
+	return string(updated)
+}
+
+func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, convID string, tools []toolcalling.ToolDef, local map[string]bool) (toolLoopResult, error) {
+	currentConvID := convID
+	seen := make(map[string]bool)
+	for iteration := 0; ; iteration++ {
+		text, thinking, backendCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, currentConvID, api.config.UserOID, api.config.TenantID, len(tools) > 0)
+		if err != nil {
+			return toolLoopResult{}, err
+		}
+		if finalConvID != "" {
+			currentConvID = finalConvID
+		}
+		if len(tools) == 0 {
+			return toolLoopResult{text: text, thinking: thinking, toolCalls: backendCalls, finishReason: finishReason, conversationID: currentConvID}, nil
+		}
+		var simulated toolcalling.SimulatedResult
+		if provider == toolLoopAnthropic {
+			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools))
+		} else {
+			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools))
+		}
+		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
+			if simulated.HasPayload {
+				text, finishReason = simulated.Content, "stop"
+			}
+			return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: currentConvID}, nil
+		}
+		var callerCalls []client.ToolCall
+		var localCalls []toolcalling.ToolCall
+		for _, call := range simulated.ToolCalls {
+			converted := client.ToolCall{ID: call.ID, Type: "function", Function: client.ToolCallFunction{Name: call.Name, Arguments: string(call.Arguments)}}
+			if local[call.Name] {
+				localCalls = append(localCalls, call)
+			} else {
+				callerCalls = append(callerCalls, converted)
+			}
+		}
+		if len(callerCalls) > 0 {
+			return toolLoopResult{thinking: thinking, toolCalls: callerCalls, finishReason: "tool_calls", conversationID: currentConvID}, nil
+		}
+		if iteration >= api.config.CodeToolMaxIterations-1 {
+			return toolLoopResult{}, errors.New("coding tool iteration limit reached")
+		}
+		var resultParts []string
+		for _, call := range localCalls {
+			key := call.Name + "\x00" + string(call.Arguments)
+			if seen[key] {
+				return toolLoopResult{}, fmt.Errorf("duplicate coding tool call %q", call.Name)
+			}
+			seen[key] = true
+			var arguments map[string]any
+			if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
+				arguments = map[string]any{}
+			}
+			encoded, err := codingtools.MarshalResult(api.codeTools.Execute(r.Context(), call.Name, arguments))
+			if err != nil {
+				return toolLoopResult{}, fmt.Errorf("serialize coding tool result: %w", err)
+			}
+			resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
+		}
+		messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
+		request := map[string]any{"model": cfg.OpenAIID, "messages": messages, "tools": tools, "stream": false}
+		requestJSON, err := json.Marshal(request)
+		if err != nil {
+			return toolLoopResult{}, fmt.Errorf("serialize coding tool continuation: %w", err)
+		}
+		if provider == toolLoopAnthropic {
+			injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto")
+		} else {
+			injectSimulatedPrompt(&messages, string(requestJSON), "auto")
+		}
+	}
+}
+
 // handleChatCompletions handles OpenAI chat completion requests.
 func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
@@ -575,11 +729,11 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Inject simulated tool prompt if tool calling is enabled.
-	// The entire request JSON is sent as the prompt; M365 returns a full
-	// chat.completion response in a ```json block.
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
+	req.Tools = preparedTools
+	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
-		injectSimulatedPrompt(&req.Messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice))
 	}
 
 	// Resolve session ID and conversation ID
@@ -609,6 +763,15 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
 
+	if len(localTools) > 0 {
+		result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, convID, req.Tools, localTools)
+		if err != nil {
+			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+			return
+		}
+		api.respondBufferedChat(w, result, cfg, sid, req.MaxTokens, req.Stream)
+		return
+	}
 	if req.Stream {
 		api.streamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools)
 	} else {
@@ -810,11 +973,11 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	chatMessages = append(chatMessages, req.Messages...)
 
-	// Inject simulated tool prompt if tool calling is enabled.
-	// The entire Anthropic request JSON is sent as the prompt; M365 returns
-	// a full Anthropic Messages response in a ```json block.
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, true)
+	req.Tools = preparedTools
+	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
-		injectSimulatedPromptAnthropic(&chatMessages, string(bodyBytes), anthropicToolChoiceString(req.ToolChoice))
+		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice))
 	}
 
 	// Resolve session ID and conversation ID
@@ -833,6 +996,15 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	// Determine if client-defined tools are present (for optionsSets stripping)
 	hasTools := len(req.Tools) > 0
 
+	if len(localTools) > 0 {
+		result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, convID, req.Tools, localTools)
+		if err != nil {
+			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
+			return
+		}
+		api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream)
+		return
+	}
 	if req.Stream {
 		api.streamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	} else {
@@ -1235,6 +1407,35 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 }
 
+func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoopResult, cfg models.ModelConfig, sid string, maxTokens int, stream bool) {
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
+			result.text, result.finishReason = truncated, "length"
+		}
+	}
+	if sid != "" && result.conversationID != "" {
+		api.ctxCache.Set("session:"+sid, result.conversationID)
+	}
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		id := fmt.Sprintf("chatcmpl-%s", uuid.New().String())
+		if result.text != "" {
+			api.sendSSEChunk(w, id, cfg.OpenAIID, map[string]any{"role": "assistant", "content": result.text})
+		}
+		for i, call := range result.toolCalls {
+			api.sendSSEChunk(w, id, cfg.OpenAIID, map[string]any{"tool_calls": []map[string]any{{"index": i, "id": call.ID, "type": "function", "function": map[string]string{"name": call.Function.Name, "arguments": call.Function.Arguments}}}})
+		}
+		api.sendSSEDone(w, id, cfg.OpenAIID, result.finishReason, nil)
+		return
+	}
+	message := map[string]any{"role": "assistant", "content": result.text}
+	if len(result.toolCalls) > 0 {
+		message["content"] = nil
+		message["tool_calls"] = result.toolCalls
+	}
+	api.sendJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-%s", uuid.New().String()), "object": "chat.completion", "created": time.Now().Unix(), "model": cfg.OpenAIID, "choices": []map[string]any{{"index": 0, "message": message, "finish_reason": result.finishReason}}})
+}
+
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
@@ -1594,6 +1795,45 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
+}
+
+func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model, sid string, maxTokens int, stream bool) {
+	stopReason := "end_turn"
+	if len(result.toolCalls) > 0 {
+		stopReason = "tool_use"
+	}
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
+			result.text, stopReason = truncated, "max_tokens"
+		}
+	}
+	content := []map[string]any{}
+	if result.text != "" {
+		content = append(content, map[string]any{"type": "text", "text": result.text})
+	}
+	for _, call := range result.toolCalls {
+		var input any
+		if json.Unmarshal([]byte(call.Function.Arguments), &input) != nil {
+			input = map[string]any{}
+		}
+		content = append(content, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Function.Name, "input": input})
+	}
+	if sid != "" && result.conversationID != "" {
+		api.ctxCache.Set("session:"+sid, result.conversationID)
+	}
+	response := map[string]any{"id": fmt.Sprintf("msg_%s", uuid.New().String()), "type": "message", "role": "assistant", "content": content, "model": model, "stop_reason": stopReason, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": countTokens(result.text)}}
+	if !stream {
+		api.sendJSON(w, http.StatusOK, response)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": countTokens(fmt.Sprint(messages)), "output_tokens": 0}}})
+	for i, block := range content {
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
+		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
+	}
+	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
+	api.sendAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
@@ -2344,9 +2584,11 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		messages = append([]payload.Message{instrMsg}, messages...)
 	}
 
-	// Inject simulated tool prompt if tools are present
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
+	req.Tools = preparedTools
+	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 	if len(req.Tools) > 0 {
-		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+		injectSimulatedPrompt(&messages, requestJSON, toolChoiceString(req.ToolChoice))
 	}
 
 	// Resolve session ID
@@ -2378,6 +2620,15 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	hasTools := len(req.Tools) > 0
 
+	if len(localTools) > 0 {
+		result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, convID, req.Tools, localTools)
+		if err != nil {
+			api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Response failed: %v", err))
+			return
+		}
+		api.respondBufferedResponses(w, result, messages, cfg, sid, req.MaxOutputTokens, req.Stream)
+		return
+	}
 	if req.Stream {
 		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
 	} else {
@@ -2567,6 +2818,30 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 		},
 	}
 	return resp
+}
+
+func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool) {
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
+			result.text, result.finishReason = truncated, "length"
+		}
+	}
+	if sid != "" && result.conversationID != "" {
+		api.ctxCache.Set("session:"+sid, result.conversationID)
+	}
+	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
+	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, result.finishReason, countTokens(fmt.Sprint(messages)), countTokens(result.text), countTokens(result.thinking))
+	if !stream {
+		api.sendJSON(w, http.StatusOK, response)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, event := range []string{"response.created", "response.in_progress"} {
+		data, _ := json.Marshal(map[string]any{"type": event, "response": map[string]any{"id": responseID, "object": "response", "status": "in_progress", "model": cfg.OpenAIID}})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+	completed, _ := json.Marshal(map[string]any{"type": "response.completed", "response": response})
+	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", completed)
 }
 
 // nonStreamResponses handles non-streaming Responses API requests.

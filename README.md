@@ -631,6 +631,51 @@ Response:
 - `tool_result` messages (OpenAI) and `tool_use`/`tool_result` content blocks (Anthropic) in conversation history are converted to plain text before being sent to M365, since the M365 backend does not understand tool roles.
 - Streaming endpoints buffer the full response before parsing tool calls (tool call JSON may span multiple chunks).
 
+## Built-in Coding Tools (Opt-in)
+
+M365Bridge can execute a restricted set of local coding operations on the server. This feature is **disabled by default** and its main gate is `M365_ENABLE_CODE_TOOLS=1`. It is available on OpenAI Chat Completions (`/v1/chat/completions`), Anthropic Messages (`/v1/messages`), and OpenAI Responses (`/v1/responses`).
+
+When enabled, tools explicitly included in a request are recognized and executed locally. `M365_AUTO_EXPOSE_TOOLS=1` also adds all built-in tools to requests automatically; leave it at `0` when clients should select tools explicitly. The server sends local results back to the model and continues until the model returns a final answer, emits a caller-defined tool call, or reaches the iteration limit. Because tool calls and intermediate results must be collected first, requests using built-in tools buffer the complete model response even when `stream: true`, then emit the provider-compatible streaming response.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `M365_ENABLE_CODE_TOOLS` | `0` | Main gate. Set to `1` to enable local tool execution. |
+| `M365_AUTO_EXPOSE_TOOLS` | `0` | Set to `1` to inject all built-in tool schemas when the client does not provide them. |
+| `M365_WORKSPACE_DIR` | `.` | Existing directory that confines file and Git operations. |
+| `M365_CODE_TOOL_TIMEOUT` | `30s` | Timeout for each command or test execution. Accepts Go duration syntax, such as `10s` or `2m`. |
+| `M365_CODE_TOOL_MAX_OUTPUT` | `1048576` | Maximum captured command output in bytes. Longer output is truncated. |
+| `M365_CODE_TOOL_MAX_READ_BYTES` | `1048576` | Maximum number of bytes returned by a file read. |
+| `M365_CODE_TOOL_MAX_ITERATIONS` | `10` | Maximum model/tool loop iterations per request. |
+
+Set these variables in `data/.env`. For Docker, `M365_WORKSPACE_DIR` must refer to a directory that already exists inside the container. The provided Compose file mounts only `./data` at `/app/data`; it does not expose a host source workspace.
+
+### Available Tools
+
+| Tool | Operation |
+|------|-----------|
+| `list_files` | List files and directories under a workspace path. |
+| `read_file` | Read a file, subject to the configured byte limit. |
+| `write_file` | Create or replace a file inside the workspace. |
+| `search_files` | Search workspace file contents. |
+| `git_status` | Show workspace Git status. |
+| `git_diff` | Show workspace Git changes. |
+| `git_log` | Show recent workspace Git history. |
+| `shell_command` | Run a shell command with the workspace as its working directory. |
+| `apply_patch` | Apply a unified patch inside the workspace. |
+| `run_tests` | Run a test command with the configured timeout and output limit. |
+
+### Security Requirements
+
+Enabling these tools turns the API into a remote code and file access surface. **Configure `M365_API_KEYS` or `M365_API_KEY` before enabling them; API key authentication is mandatory for every deployment with coding tools enabled.** Do not expose such a deployment directly to the public internet. Use a least-privilege service account, a dedicated workspace, strict filesystem permissions, network isolation, and container resource limits.
+
+- **OWASP Broken Access Control:** a missing, leaked, or shared API key can let unauthorized callers read, modify, or execute within the mounted workspace. Use unique, rotated keys and enforce authorization at a trusted reverse proxy as well.
+- **Command Injection:** `shell_command` and `run_tests` execute model-selected command strings. Treat prompts, repository content, patches, and tool arguments as untrusted input; isolate the process and never provide production credentials.
+- **Path Traversal:** file tools confine resolved paths to `M365_WORKSPACE_DIR`, but an overly broad workspace or unsafe mount still exposes sensitive files. Mount only the required project directory and review symlinks and permissions.
+- **Sensitive Data Exposure:** tool output and file contents can be returned to the caller and sent to the M365 backend. Keep secrets, tokens, `.env` files, SSH keys, cloud credentials, and customer data outside the workspace.
+- **Resource exhaustion:** commands, recursive searches, large files, output, and repeated tool loops can consume CPU, memory, disk, and process capacity. Keep timeout, output, read, and iteration limits conservative and enforce container or OS quotas.
+
 ## Responses API
 
 The `/v1/responses` endpoint implements the OpenAI Responses API format. It accepts `input` (string or array of typed items), `instructions`, `max_output_tokens`, `tools`, and `previous_response_id` for conversation continuity.

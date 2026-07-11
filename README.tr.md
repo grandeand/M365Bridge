@@ -631,6 +631,51 @@ Yanıt:
 - Konuşma geçmişindeki `tool_result` mesajları (OpenAI) ve `tool_use`/`tool_result` içerik blokları (Anthropic), M365 backend'i tool rollerini anlamadığı için M365'ye gönderilmeden önce düz metne dönüştürülür.
 - Streaming endpoint'leri, tool call'ları ayrıştırmadan önce tam yanıtı tampona alır (tool call JSON'u birden çok chunk'a yayılabilir).
 
+## Built-in Coding Tools (Opt-in)
+
+M365Bridge, sunucuda kısıtlı bir yerel coding işlemleri kümesi çalıştırabilir. Bu özellik **varsayılan olarak kapalıdır** ve ana gate `M365_ENABLE_CODE_TOOLS=1` ayarıdır. OpenAI Chat Completions (`/v1/chat/completions`), Anthropic Messages (`/v1/messages`) ve OpenAI Responses (`/v1/responses`) üzerinde kullanılabilir.
+
+Özellik etkinleştirildiğinde, istekte açıkça bulunan araçlar tanınır ve yerel olarak çalıştırılır. `M365_AUTO_EXPOSE_TOOLS=1`, istemci araç sağlamadığında tüm built-in araçları isteğe otomatik olarak ekler; araçları istemcilerin açıkça seçmesi gerekiyorsa değeri `0` olarak bırakın. Sunucu, yerel sonuçları modele geri gönderir ve model nihai yanıt verene, istemci tanımlı bir tool call üretene veya iteration sınırına ulaşana kadar sürdürür. Tool call'ların ve ara sonuçların önce toplanması gerektiğinden, built-in araç kullanan istekler `stream: true` olsa bile model yanıtının tamamını buffer'a alır, ardından provider uyumlu streaming yanıtını yayınlar.
+
+### Yapılandırma
+
+| Değişken | Varsayılan | Açıklama |
+|----------|------------|----------|
+| `M365_ENABLE_CODE_TOOLS` | `0` | Ana gate. Yerel araç çalıştırmayı etkinleştirmek için `1` yapın. |
+| `M365_AUTO_EXPOSE_TOOLS` | `0` | İstemci araç sağlamadığında tüm built-in tool şemalarını eklemek için `1` yapın. |
+| `M365_WORKSPACE_DIR` | `.` | Dosya ve Git işlemlerini sınırlayan mevcut dizin. |
+| `M365_CODE_TOOL_TIMEOUT` | `30s` | Her command veya test çalıştırması için timeout. `10s` ya da `2m` gibi Go duration sözdizimini kabul eder. |
+| `M365_CODE_TOOL_MAX_OUTPUT` | `1048576` | Yakalanan command çıktısının byte cinsinden üst sınırı. Daha uzun çıktı kırpılır. |
+| `M365_CODE_TOOL_MAX_READ_BYTES` | `1048576` | Bir file read işleminin döndürebileceği azami byte sayısı. |
+| `M365_CODE_TOOL_MAX_ITERATIONS` | `10` | İstek başına model/tool loop iteration üst sınırı. |
+
+Bu değişkenleri `data/.env` içine ekleyin. Docker kullanırken `M365_WORKSPACE_DIR`, container içinde zaten var olan bir dizini göstermelidir. Sağlanan Compose dosyası yalnızca `./data` dizinini `/app/data` konumuna mount eder; host kaynak workspace'ini açmaz.
+
+### Kullanılabilir Araçlar
+
+| Araç | İşlem |
+|------|-------|
+| `list_files` | Workspace içindeki bir path altında bulunan dosya ve dizinleri listeler. |
+| `read_file` | Yapılandırılmış byte sınırına tabi olarak dosya okur. |
+| `write_file` | Workspace içinde dosya oluşturur veya mevcut dosyanın yerini alır. |
+| `search_files` | Workspace dosyalarının içeriğinde arama yapar. |
+| `git_status` | Workspace Git durumunu gösterir. |
+| `git_diff` | Workspace Git değişikliklerini gösterir. |
+| `git_log` | Workspace içindeki yakın Git geçmişini gösterir. |
+| `shell_command` | Workspace'i çalışma dizini olarak kullanıp shell command çalıştırır. |
+| `apply_patch` | Workspace içinde unified patch uygular. |
+| `run_tests` | Yapılandırılmış timeout ve output sınırıyla bir test command çalıştırır. |
+
+### Güvenlik Gereksinimleri
+
+Bu araçları etkinleştirmek, API'yi uzaktan kod ve dosya erişim yüzeyine dönüştürür. **Araçları etkinleştirmeden önce `M365_API_KEYS` veya `M365_API_KEY` yapılandırın; coding tools etkin olan her deployment için API key kimlik doğrulaması zorunludur.** Böyle bir deployment'ı doğrudan public internet'e açmayın. Least-privilege service account, ayrılmış workspace, sıkı dosya sistemi izinleri, network isolation ve container resource limitleri kullanın.
+
+- **OWASP Broken Access Control:** eksik, sızmış veya paylaşılan bir API key, yetkisiz çağıranların mount edilen workspace'i okumasına, değiştirmesine veya burada komut çalıştırmasına izin verebilir. Benzersiz ve düzenli yenilenen key'ler kullanın; ayrıca güvenilir bir reverse proxy üzerinde authorization uygulayın.
+- **Command Injection:** `shell_command` ve `run_tests`, modelin seçtiği command dizelerini çalıştırır. Prompt'ları, repo içeriğini, patch'leri ve tool argümanlarını güvenilmeyen girdi kabul edin; process'i izole edin ve production credential'ları vermeyin.
+- **Path Traversal:** file tools, çözümlenen path'leri `M365_WORKSPACE_DIR` ile sınırlar; ancak gereğinden geniş bir workspace veya güvensiz mount yine de hassas dosyaları açığa çıkarır. Yalnızca gereken proje dizinini mount edin, symlink'leri ve izinleri inceleyin.
+- **Sensitive Data Exposure:** tool çıktısı ve dosya içeriği çağırana döndürülebilir ve M365 backend'ine gönderilebilir. Secret'ları, token'ları, `.env` dosyalarını, SSH key'lerini, cloud credential'larını ve müşteri verilerini workspace dışında tutun.
+- **Resource exhaustion:** command'ler, recursive aramalar, büyük dosyalar, output ve yinelenen tool loop'ları CPU, memory, disk ve process kapasitesi tüketebilir. Timeout, output, read ve iteration sınırlarını ölçülü tutun; container veya işletim sistemi quota'ları uygulayın.
+
 ## Responses API
 
 `/v1/responses` uç noktası, OpenAI Responses API formatını uygular. `input` (string veya tipli öğe dizisi), `instructions`, `max_output_tokens`, `tools` ve konuşma sürekliliği için `previous_response_id` kabul eder.

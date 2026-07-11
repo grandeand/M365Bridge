@@ -60,19 +60,19 @@ var fileUploadOptions = map[string]bool{
 // them to its own sandbox instead of emitting tool calls for the client.
 // This is the primary infrastructure lever (cramt/m365-copilot-proxy approach).
 var codeInterpreterOptions = map[string]bool{
-	"cwc_code_interpreter": true,
-	"cwc_code_interpreter_amsfix": true,
-	"cwcfluxgptv": true,
-	"gptvnorm2048": true,
-	"cwc_code_interpreter_citation_fix": true,
-	"code_interpreter_interactive_charts": true,
+	"cwc_code_interpreter":                                 true,
+	"cwc_code_interpreter_amsfix":                          true,
+	"cwcfluxgptv":                                          true,
+	"gptvnorm2048":                                         true,
+	"cwc_code_interpreter_citation_fix":                    true,
+	"code_interpreter_interactive_charts":                  true,
 	"cwc_code_interpreter_interactive_charts_inline_image": true,
-	"code_interpreter_matplotlib_patching": true,
+	"code_interpreter_matplotlib_patching":                 true,
 }
 
 // imageUploadOptions contains option flags needed for image upload support.
 var imageUploadOptions = map[string]bool{
-	"cwc_flux_image":                                    true,
+	"cwc_flux_image": true,
 	"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch": true,
 }
 
@@ -90,12 +90,12 @@ var allowedMessageTypes = []string{
 
 // Message represents a chat message in the conversation history.
 type Message struct {
-	Role        string             `json:"role"`
-	Content     string             `json:"content"`
-	Name        string             `json:"name,omitempty"`
-	Images      []ImageData        `json:"-"`
+	Role        string              `json:"role"`
+	Content     string              `json:"content"`
+	Name        string              `json:"name,omitempty"`
+	Images      []ImageData         `json:"-"`
 	Annotations []MessageAnnotation `json:"-"`
-	ToolCallID  string             `json:"tool_call_id,omitempty"` // OpenAI tool role messages
+	ToolCallID  string              `json:"tool_call_id,omitempty"` // OpenAI tool role messages
 }
 
 // ImageData represents an image extracted from multimodal content.
@@ -123,8 +123,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		Name       string          `json:"name,omitempty"`
 		ToolCallID string          `json:"tool_call_id,omitempty"`
 		ToolCalls  []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
+			ID       string `json:"id"`
+			Type     string `json:"type"`
 			Function struct {
 				Name      string `json:"name"`
 				Arguments string `json:"arguments"`
@@ -330,25 +330,25 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 		"target":       "chat",
 		"arguments": []map[string]interface{}{
 			{
-				"source":                "officeweb",
-				"clientCorrelationId":   hexSID,
-				"sessionId":             uuidSID,
-				"message":              buildFullMessage(hexSID, text, nil),
-				"optionsSets":           options,
-				"streamingMode":         "ConciseWithPadding",
-				"spokenTextMode":        "None",
-				"options":               map[string]interface{}{},
+				"source":                   "officeweb",
+				"clientCorrelationId":      hexSID,
+				"sessionId":                uuidSID,
+				"message":                  buildFullMessage(hexSID, text, nil),
+				"optionsSets":              options,
+				"streamingMode":            "ConciseWithPadding",
+				"spokenTextMode":           "None",
+				"options":                  map[string]interface{}{},
 				"extraExtensionParameters": map[string]interface{}{},
-				"allowedMessageTypes":   allowedMessageTypes,
-				"sliceIds":              []string{},
-				"tone":                  tone,
+				"allowedMessageTypes":      allowedMessageTypes,
+				"sliceIds":                 []string{},
+				"tone":                     tone,
 				"plugins": []map[string]string{
 					{"Id": "BingWebSearch", "Source": "BuiltIn"},
 				},
-				"isStartOfSession":      false,
-				"isSbsSupported":        true,
+				"isStartOfSession":          false,
+				"isSbsSupported":            true,
 				"renderReferencesBehindEOS": true,
-				"disconnectBehavior":    "continue",
+				"disconnectBehavior":        "continue",
 			},
 		},
 	}
@@ -407,25 +407,25 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 		"target":       "chat",
 		"arguments": []map[string]interface{}{
 			{
-				"source":                "officeweb",
-				"clientCorrelationId":   hexSID,
-				"sessionId":             uuidSID,
-				"message":              buildMinimalMessage(hexSID, lastText, annotations),
-				"optionsSets":           options,
-				"streamingMode":         "ConciseWithPadding",
-				"spokenTextMode":        "None",
-				"options":               map[string]interface{}{},
+				"source":                   "officeweb",
+				"clientCorrelationId":      hexSID,
+				"sessionId":                uuidSID,
+				"message":                  buildMinimalMessage(hexSID, lastText, annotations),
+				"optionsSets":              options,
+				"streamingMode":            "ConciseWithPadding",
+				"spokenTextMode":           "None",
+				"options":                  map[string]interface{}{},
 				"extraExtensionParameters": map[string]interface{}{},
-				"allowedMessageTypes":   allowedMessageTypes,
-				"sliceIds":              []string{},
-				"tone":                  tone,
+				"allowedMessageTypes":      allowedMessageTypes,
+				"sliceIds":                 []string{},
+				"tone":                     tone,
 				"plugins": []map[string]string{
 					{"Id": "BingWebSearch", "Source": "BuiltIn"},
 				},
-				"isStartOfSession":      false,
-				"isSbsSupported":        true,
+				"isStartOfSession":          false,
+				"isSbsSupported":            true,
 				"renderReferencesBehindEOS": true,
-				"disconnectBehavior":    "continue",
+				"disconnectBehavior":        "continue",
 			},
 		},
 	}
@@ -453,21 +453,21 @@ func buildFullMessage(hexSID, text string, annotations []MessageAnnotation) map[
 	tzName := getTZName()
 
 	msg := map[string]interface{}{
-		"author":             "user",
-		"inputMethod":        "Keyboard",
-		"text":               text,
-		"entityAnnotationTypes": []string{"People", "File", "Event", "Email", "TeamsMessage"},
+		"author":                        "user",
+		"inputMethod":                   "Keyboard",
+		"text":                          text,
+		"entityAnnotationTypes":         []string{"People", "File", "Event", "Email", "TeamsMessage"},
 		"connectedFederatedConnections": []string{"dummyId"},
-		"requestId":          hexSID + "_0",
+		"requestId":                     hexSID + "_0",
 		"locationInfo": map[string]interface{}{
 			"timeZoneOffset": offset / 3600,
 			"timeZone":       tzName,
 		},
-		"locale":             getLocale(),
-		"messageType":        "Chat",
-		"experienceType":     "Default",
-		"adaptiveCards":      []interface{}{},
-		"clientPreferences":  map[string]interface{}{},
+		"locale":            getLocale(),
+		"messageType":       "Chat",
+		"experienceType":    "Default",
+		"adaptiveCards":     []interface{}{},
+		"clientPreferences": map[string]interface{}{},
 	}
 
 	if len(annotations) > 0 {
@@ -485,20 +485,20 @@ func buildMinimalMessage(hexSID, text string, annotations []MessageAnnotation) m
 	tzName := getTZName()
 
 	msg := map[string]interface{}{
-		"author":             "user",
-		"inputMethod":        "Keyboard",
-		"text":               text,
+		"author":                "user",
+		"inputMethod":           "Keyboard",
+		"text":                  text,
 		"entityAnnotationTypes": []string{},
-		"requestId":          hexSID + "_0",
+		"requestId":             hexSID + "_0",
 		"locationInfo": map[string]interface{}{
 			"timeZoneOffset": offset / 3600,
 			"timeZone":       tzName,
 		},
-		"locale":             getLocale(),
-		"messageType":        "Chat",
-		"experienceType":     "Default",
-		"adaptiveCards":      []interface{}{},
-		"clientPreferences":  map[string]interface{}{},
+		"locale":            getLocale(),
+		"messageType":       "Chat",
+		"experienceType":    "Default",
+		"adaptiveCards":     []interface{}{},
+		"clientPreferences": map[string]interface{}{},
 	}
 
 	if len(annotations) > 0 {
@@ -568,12 +568,12 @@ func buildM365History(messages []Message) []map[string]interface{} {
 				content = lastText
 			}
 			history = append(history, map[string]interface{}{
-				"author":         "user",
-				"inputMethod":    "Keyboard",
-				"text":           content,
-				"messageType":    "Chat",
-				"experienceType": "Default",
-				"adaptiveCards":  []interface{}{},
+				"author":            "user",
+				"inputMethod":       "Keyboard",
+				"text":              content,
+				"messageType":       "Chat",
+				"experienceType":    "Default",
+				"adaptiveCards":     []interface{}{},
 				"clientPreferences": map[string]interface{}{},
 			})
 			lastText = content
@@ -588,11 +588,11 @@ func buildM365History(messages []Message) []map[string]interface{} {
 			}
 		case "tool":
 			history = append(history, map[string]interface{}{
-				"author":         "user",
-				"inputMethod":    "Keyboard",
-				"text":           fmt.Sprintf("[Tool result: %s]", msg.Content),
-				"messageType":    "Chat",
-				"adaptiveCards":  []interface{}{},
+				"author":            "user",
+				"inputMethod":       "Keyboard",
+				"text":              fmt.Sprintf("[Tool result: %s]", msg.Content),
+				"messageType":       "Chat",
+				"adaptiveCards":     []interface{}{},
 				"clientPreferences": map[string]interface{}{},
 			})
 		}
