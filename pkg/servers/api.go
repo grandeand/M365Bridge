@@ -2479,6 +2479,58 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 	return result, nil
 }
 
+func parseResponsesSimulationWithRetry(
+	text string,
+	policy responsesToolPolicy,
+	retry func() (string, error),
+) (responsesSimulationResult, error) {
+	result, err := parseResponsesSimulation(text, policy)
+	if err == nil || retry == nil ||
+		!errors.Is(err, errSimulatedToolCallRequired) {
+		return result, err
+	}
+
+	retryText, retryErr := retry()
+	if retryErr != nil {
+		return responsesSimulationResult{}, fmt.Errorf(
+			"%w: retry failed: %v",
+			errSimulatedToolCallRequired,
+			retryErr,
+		)
+	}
+	return parseResponsesSimulation(retryText, policy)
+}
+
+func responsesSimulationRetryMessages(
+	messages []payload.Message,
+	policy responsesToolPolicy,
+) []payload.Message {
+	retryInstruction := "RETRY: The previous result was invalid. "
+	if policy.requiredName != "" {
+		retryInstruction += fmt.Sprintf(
+			"Return exactly one valid tool call named %q inside the required chat-completion JSON envelope. Plain content is invalid.",
+			policy.requiredName,
+		)
+	} else {
+		retryInstruction += fmt.Sprintf(
+			"Return at least one valid tool call using only these client tools: %s. Plain content is invalid.",
+			strings.Join(policy.allowedToolNames, ", "),
+		)
+	}
+
+	retried := append([]payload.Message(nil), messages...)
+	for index := len(retried) - 1; index >= 0; index-- {
+		if retried[index].Role == "user" {
+			retried[index].Content += "\n\n" + retryInstruction
+			return retried
+		}
+	}
+	return append(retried, payload.Message{
+		Role:    "user",
+		Content: retryInstruction,
+	})
+}
+
 func responsesReasoningForOutput(thinking string, simulated bool) string {
 	if simulated {
 		return ""
@@ -2546,7 +2598,7 @@ func writeResponsesUpstreamEmptyError(w http.ResponseWriter, stream bool, respon
 		responseID,
 		model,
 		upstreamEmptyResponseCode,
-		"M365 returned an empty response; the upstream service may be throttling this account",
+		"M365 returned an empty response without a completion message",
 	)
 }
 
@@ -2990,7 +3042,32 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 
 	// Parse simulated tool calls from response text
 	if toolPolicy.simulate {
-		simulated, parseErr := parseResponsesSimulation(respText, toolPolicy)
+		simulated, parseErr := parseResponsesSimulationWithRetry(
+			respText,
+			toolPolicy,
+			func() (string, error) {
+				retryText, retryThinking, retryToolCalls,
+					retryFinishReason, retryConvID, retryErr :=
+					api.m365Client.ChatConversation(
+						responsesSimulationRetryMessages(messages, toolPolicy),
+						cfg.Tone,
+						cfg.Override,
+						"",
+						api.config.UserOID,
+						api.config.TenantID,
+						true,
+					)
+				if retryErr != nil {
+					return "", retryErr
+				}
+				respText = retryText
+				thinking = retryThinking
+				toolCalls = retryToolCalls
+				finishReason = retryFinishReason
+				finalConvID = retryConvID
+				return retryText, nil
+			},
+		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
@@ -3283,7 +3360,30 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	finishReason := "stop"
 
 	if toolCallingEnabled {
-		simulated, parseErr := parseResponsesSimulation(fullText, toolPolicy)
+		simulated, parseErr := parseResponsesSimulationWithRetry(
+			fullText,
+			toolPolicy,
+			func() (string, error) {
+				retryText, _, _, _, retryConvID, retryErr :=
+					api.m365Client.ChatConversation(
+						responsesSimulationRetryMessages(messages, toolPolicy),
+						cfg.Tone,
+						cfg.Override,
+						"",
+						api.config.UserOID,
+						api.config.TenantID,
+						true,
+					)
+				if retryErr != nil {
+					return "", retryErr
+				}
+				fullText = retryText
+				finalConvID = retryConvID
+				contentExtractor = toolcalling.ContentStreamExtractor{}
+				contentExtractor.Feed(retryText)
+				return retryText, nil
+			},
+		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
@@ -3294,7 +3394,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		committedContent := contentExtractor.Commit(
 			toolPolicy.allowedToolNames,
 		)
-		if committedContent != "" || simulated.content == "" {
+		if len(simulated.toolCalls) == 0 &&
+			(committedContent != "" || simulated.content == "") {
 			simulated.content = committedContent
 		}
 		fullText = simulated.content

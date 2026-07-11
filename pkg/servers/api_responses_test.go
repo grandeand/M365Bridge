@@ -139,6 +139,39 @@ func TestParseResponsesSimulationRequiredRejectsPlainContent(t *testing.T) {
 	}
 }
 
+func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) {
+	policy, err := newResponsesToolPolicy(
+		responsesTestTools(),
+		map[string]interface{}{"type": "function", "name": "read_nonce"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := "```json\n" +
+		`{"choices":[{"message":{"role":"assistant","content":"No tool."},"finish_reason":"stop"}]}` +
+		"\n```"
+	retries := 0
+
+	result, err := parseResponsesSimulationWithRetry(
+		first,
+		policy,
+		func() (string, error) {
+			retries++
+			return simulatedToolCallEnvelope("read_nonce"), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("required tool retry failed: %v", err)
+	}
+	if retries != 1 {
+		t.Fatalf("retry count = %d, want 1", retries)
+	}
+	if len(result.toolCalls) != 1 ||
+		result.toolCalls[0].Function.Name != "read_nonce" {
+		t.Fatalf("unexpected retried tool calls: %#v", result.toolCalls)
+	}
+}
+
 func TestParseResponsesSimulationNamedRejectsWrongDeclaredTool(t *testing.T) {
 	policy, err := newResponsesToolPolicy(
 		responsesTestTools(),
@@ -642,6 +675,12 @@ func TestWriteResponsesUpstreamEmptyErrorNonStreaming(t *testing.T) {
 	errorObject, _ := body["error"].(map[string]interface{})
 	if errorObject["code"] != upstreamEmptyResponseCode {
 		t.Fatalf("error code = %#v, want %q", errorObject["code"], upstreamEmptyResponseCode)
+	}
+	if message, _ := errorObject["message"].(string); strings.Contains(
+		strings.ToLower(message),
+		"throttl",
+	) {
+		t.Fatalf("empty response error speculates about throttling: %q", message)
 	}
 }
 
