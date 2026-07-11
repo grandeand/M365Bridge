@@ -25,10 +25,10 @@ const (
 
 // TokenRefreshError is returned when token refresh operations fail.
 var (
-	ErrKeyGeneration   = errors.New("failed to generate encryption key")
-	ErrEncryption      = errors.New("encryption failed")
-	ErrDecryption      = errors.New("decryption failed")
-	ErrInvalidKey      = errors.New("invalid key length")
+	ErrKeyGeneration     = errors.New("failed to generate encryption key")
+	ErrEncryption        = errors.New("encryption failed")
+	ErrDecryption        = errors.New("decryption failed")
+	ErrInvalidKey        = errors.New("invalid key length")
 	ErrInvalidCiphertext = errors.New("invalid ciphertext")
 )
 

@@ -142,7 +142,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	if len(raw.ToolCalls) > 0 {
 		var sb strings.Builder
 		for _, tc := range raw.ToolCalls {
-			sb.WriteString(fmt.Sprintf("[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments))
+			fmt.Fprintf(&sb, "[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments)
 		}
 		m.Content = strings.TrimSpace(sb.String())
 	}
@@ -168,7 +168,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	}
 
 	// Try array of content blocks
-	var blocks []map[string]interface{}
+	var blocks []map[string]any
 	if err := json.Unmarshal(raw.Content, &blocks); err != nil {
 		return fmt.Errorf("content must be string or array of content blocks")
 	}
@@ -182,7 +182,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			}
 		case "image_url":
 			// OpenAI format: {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-			if imgURL, ok := block["image_url"].(map[string]interface{}); ok {
+			if imgURL, ok := block["image_url"].(map[string]any); ok {
 				if url, ok := imgURL["url"].(string); ok {
 					if img := parseDataURL(url); img != nil {
 						m.Images = append(m.Images, *img)
@@ -191,7 +191,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			}
 		case "image":
 			// Anthropic format: {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
-			if src, ok := block["source"].(map[string]interface{}); ok {
+			if src, ok := block["source"].(map[string]any); ok {
 				if srcType, ok := src["type"].(string); ok && srcType == "base64" {
 					mediaType, _ := src["media_type"].(string)
 					base64Data, _ := src["data"].(string)
@@ -207,7 +207,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		case "tool_use":
 			// Anthropic assistant message: previous tool call
 			name, _ := block["name"].(string)
-			input, _ := block["input"]
+			input := block["input"]
 			if inputBytes, err := json.Marshal(input); err == nil {
 				m.Content += fmt.Sprintf("\n[Previous Tool Call: %s]\nArguments: %s\n", name, string(inputBytes))
 			}
@@ -217,9 +217,9 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			resultContent := ""
 			if c, ok := block["content"].(string); ok {
 				resultContent = c
-			} else if cArr, ok := block["content"].([]interface{}); ok {
+			} else if cArr, ok := block["content"].([]any); ok {
 				for _, cItem := range cArr {
-					if cMap, ok := cItem.(map[string]interface{}); ok {
+					if cMap, ok := cItem.(map[string]any); ok {
 						if txt, ok := cMap["text"].(string); ok {
 							resultContent += txt
 						}
@@ -246,12 +246,10 @@ func parseDataURL(url string) *ImageData {
 	}
 	mediaType := rest[:semiIdx]
 	rest = rest[semiIdx+1:]
-	commaIdx := strings.Index(rest, ",")
-	if commaIdx < 0 {
+	encoding, base64Data, found := strings.Cut(rest, ",")
+	if !found {
 		return nil
 	}
-	encoding := rest[:commaIdx]
-	base64Data := rest[commaIdx+1:]
 	if encoding != "base64" {
 		return nil
 	}
@@ -324,11 +322,11 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 	invocationID := uuid.New().String()
 	options := getOptions(enableFileUpload, false, hasTools, extraOptions)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"type":         4,
 		"invocationId": invocationID,
 		"target":       "chat",
-		"arguments": []map[string]interface{}{
+		"arguments": []map[string]any{
 			{
 				"source":                   "officeweb",
 				"clientCorrelationId":      hexSID,
@@ -337,8 +335,8 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 				"optionsSets":              options,
 				"streamingMode":            "ConciseWithPadding",
 				"spokenTextMode":           "None",
-				"options":                  map[string]interface{}{},
-				"extraExtensionParameters": map[string]interface{}{},
+				"options":                  map[string]any{},
+				"extraExtensionParameters": map[string]any{},
 				"allowedMessageTypes":      allowedMessageTypes,
 				"sliceIds":                 []string{},
 				"tone":                     tone,
@@ -354,7 +352,7 @@ func BuildPayload(hexSID, uuidSID, text, tone, gptOverride string, enableFileUpl
 	}
 
 	if gptOverride != "" {
-		args := payload["arguments"].([]map[string]interface{})
+		args := payload["arguments"].([]map[string]any)
 		args[0]["gptIdOverride"] = map[string]string{
 			"id":     gptOverride,
 			"source": "MOS3",
@@ -401,11 +399,11 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 
 	options := getOptions(enableFileUpload, hasImages, hasTools, extraOptions)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"type":         4,
 		"invocationId": invocationID,
 		"target":       "chat",
-		"arguments": []map[string]interface{}{
+		"arguments": []map[string]any{
 			{
 				"source":                   "officeweb",
 				"clientCorrelationId":      hexSID,
@@ -414,8 +412,8 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 				"optionsSets":              options,
 				"streamingMode":            "ConciseWithPadding",
 				"spokenTextMode":           "None",
-				"options":                  map[string]interface{}{},
-				"extraExtensionParameters": map[string]interface{}{},
+				"options":                  map[string]any{},
+				"extraExtensionParameters": map[string]any{},
 				"allowedMessageTypes":      allowedMessageTypes,
 				"sliceIds":                 []string{},
 				"tone":                     tone,
@@ -431,7 +429,7 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 	}
 
 	if gptOverride != "" {
-		args := payload["arguments"].([]map[string]interface{})
+		args := payload["arguments"].([]map[string]any)
 		args[0]["gptIdOverride"] = map[string]string{
 			"id":     gptOverride,
 			"source": "MOS3",
@@ -447,27 +445,27 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, tone, 
 
 // buildFullMessage constructs a full message object for single-message requests.
 // Uses the full entityAnnotationTypes and connectedFederatedConnections.
-func buildFullMessage(hexSID, text string, annotations []MessageAnnotation) map[string]interface{} {
+func buildFullMessage(hexSID, text string, annotations []MessageAnnotation) map[string]any {
 	now := time.Now()
 	_, offset := now.Zone()
 	tzName := getTZName()
 
-	msg := map[string]interface{}{
+	msg := map[string]any{
 		"author":                        "user",
 		"inputMethod":                   "Keyboard",
 		"text":                          text,
 		"entityAnnotationTypes":         []string{"People", "File", "Event", "Email", "TeamsMessage"},
 		"connectedFederatedConnections": []string{"dummyId"},
 		"requestId":                     hexSID + "_0",
-		"locationInfo": map[string]interface{}{
+		"locationInfo": map[string]any{
 			"timeZoneOffset": offset / 3600,
 			"timeZone":       tzName,
 		},
 		"locale":            getLocale(),
 		"messageType":       "Chat",
 		"experienceType":    "Default",
-		"adaptiveCards":     []interface{}{},
-		"clientPreferences": map[string]interface{}{},
+		"adaptiveCards":     []any{},
+		"clientPreferences": map[string]any{},
 	}
 
 	if len(annotations) > 0 {
@@ -479,26 +477,26 @@ func buildFullMessage(hexSID, text string, annotations []MessageAnnotation) map[
 
 // buildMinimalMessage constructs a minimal message object for conversation requests.
 // Uses empty entityAnnotationTypes and no connectedFederatedConnections.
-func buildMinimalMessage(hexSID, text string, annotations []MessageAnnotation) map[string]interface{} {
+func buildMinimalMessage(hexSID, text string, annotations []MessageAnnotation) map[string]any {
 	now := time.Now()
 	_, offset := now.Zone()
 	tzName := getTZName()
 
-	msg := map[string]interface{}{
+	msg := map[string]any{
 		"author":                "user",
 		"inputMethod":           "Keyboard",
 		"text":                  text,
 		"entityAnnotationTypes": []string{},
 		"requestId":             hexSID + "_0",
-		"locationInfo": map[string]interface{}{
+		"locationInfo": map[string]any{
 			"timeZoneOffset": offset / 3600,
 			"timeZone":       tzName,
 		},
 		"locale":            getLocale(),
 		"messageType":       "Chat",
 		"experienceType":    "Default",
-		"adaptiveCards":     []interface{}{},
-		"clientPreferences": map[string]interface{}{},
+		"adaptiveCards":     []any{},
+		"clientPreferences": map[string]any{},
 	}
 
 	if len(annotations) > 0 {
@@ -549,56 +547,6 @@ func getLocale() string {
 		return strings.ToLower(lang)
 	}
 	return "en-us"
-}
-
-// buildM365History converts OpenAI-style messages to M365 format.
-func buildM365History(messages []Message) []map[string]interface{} {
-	if len(messages) <= 1 {
-		return nil
-	}
-
-	history := make([]map[string]interface{}, 0, len(messages)-1)
-	lastText := ""
-
-	for _, msg := range messages[:len(messages)-1] {
-		switch msg.Role {
-		case "user":
-			content := msg.Content
-			if content == "" {
-				content = lastText
-			}
-			history = append(history, map[string]interface{}{
-				"author":            "user",
-				"inputMethod":       "Keyboard",
-				"text":              content,
-				"messageType":       "Chat",
-				"experienceType":    "Default",
-				"adaptiveCards":     []interface{}{},
-				"clientPreferences": map[string]interface{}{},
-			})
-			lastText = content
-		case "assistant":
-			if msg.Content != "" {
-				history = append(history, map[string]interface{}{
-					"author":      "bot",
-					"text":        msg.Content,
-					"messageType": "Chat",
-				})
-				lastText = msg.Content
-			}
-		case "tool":
-			history = append(history, map[string]interface{}{
-				"author":            "user",
-				"inputMethod":       "Keyboard",
-				"text":              fmt.Sprintf("[Tool result: %s]", msg.Content),
-				"messageType":       "Chat",
-				"adaptiveCards":     []interface{}{},
-				"clientPreferences": map[string]interface{}{},
-			})
-		}
-	}
-
-	return history
 }
 
 // getOptions returns the appropriate option set based on feature flags.

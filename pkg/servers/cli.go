@@ -11,7 +11,6 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
-	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
 
 // CLIServer handles command-line interface operations.
@@ -77,7 +76,6 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 	fmt.Println("Exit: Ctrl+C")
 
 	reader := bufio.NewReader(os.Stdin)
-	messageHistory := []payload.Message{}
 
 	for {
 		fmt.Print("\n> ")
@@ -97,15 +95,15 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 			tone = "Reasoning"
 		}
 
-		var result string
 		if options.NoStream {
-			result, err = cli.m365Client.Chat(text, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)
+			result, chatErr := cli.m365Client.Chat(text, tone, cfg.Override, "", cli.config.UserOID, cli.config.TenantID, false)
+			err = chatErr
 			if err == nil && result != "" {
 				fmt.Println(result)
 			}
 		} else {
 			fmt.Println()
-			result, err = cli.streamToStdout(text, tone, cfg.Override, "")
+			_, err = cli.streamToStdout(text, tone, cfg.Override, "")
 			fmt.Println()
 		}
 
@@ -113,9 +111,6 @@ func (cli *CLIServer) runInteractive(options *CLIOptions) error {
 			fmt.Printf("Error: %v\n", err)
 			continue
 		}
-
-		messageHistory = append(messageHistory, payload.Message{Role: "user", Content: text})
-		messageHistory = append(messageHistory, payload.Message{Role: "assistant", Content: result})
 	}
 }
 
@@ -140,7 +135,7 @@ func (cli *CLIServer) runSingleQuery(options *CLIOptions) error {
 			fmt.Println(result)
 		}
 	} else {
-		result, err = cli.streamToStdout(options.Prompt, tone, cfg.Override, "")
+		_, err = cli.streamToStdout(options.Prompt, tone, cfg.Override, "")
 	}
 
 	if err != nil {

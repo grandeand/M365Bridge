@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/google/uuid"
 )
 
 const (

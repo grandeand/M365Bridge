@@ -158,12 +158,12 @@ func runCLI() {
 
 	// Prepare options
 	options := &servers.CLIOptions{
-		Model:         *model,
-		Reasoning:     *reasoning,
-		Interactive:   *interactive,
-		NoStream:      *noStream,
-		Prompt:        flag.Arg(0),
-		ListModels:    *listModels,
+		Model:       *model,
+		Reasoning:   *reasoning,
+		Interactive: *interactive,
+		NoStream:    *noStream,
+		Prompt:      flag.Arg(0),
+		ListModels:  *listModels,
 	}
 
 	// Run CLI

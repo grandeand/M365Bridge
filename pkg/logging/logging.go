@@ -94,7 +94,7 @@ func GetLevel() LogLevel {
 }
 
 // logf is the internal formatted logger.
-func logf(lvl LogLevel, prefix, format string, args ...interface{}) {
+func logf(lvl LogLevel, prefix, format string, args ...any) {
 	mu.Lock()
 	defer mu.Unlock()
 	if lvl < level || logger == nil {
@@ -104,57 +104,57 @@ func logf(lvl LogLevel, prefix, format string, args ...interface{}) {
 }
 
 // logln is the internal line logger (no format string).
-func logln(lvl LogLevel, prefix string, args ...interface{}) {
+func logln(lvl LogLevel, prefix string, args ...any) {
 	mu.Lock()
 	defer mu.Unlock()
 	if lvl < level || logger == nil {
 		return
 	}
-	logger.Println(append([]interface{}{prefix}, args...)...)
+	logger.Println(append([]any{prefix}, args...)...)
 }
 
 // Debugf logs a DEBUG-level formatted message.
-func Debugf(format string, args ...interface{}) {
+func Debugf(format string, args ...any) {
 	logf(LevelDebug, "[DEBUG]", format, args...)
 }
 
 // Debug logs a DEBUG-level message.
-func Debug(args ...interface{}) {
+func Debug(args ...any) {
 	logln(LevelDebug, "[DEBUG]", args...)
 }
 
 // Infof logs an INFO-level formatted message.
-func Infof(format string, args ...interface{}) {
+func Infof(format string, args ...any) {
 	logf(LevelInfo, "[INFO]", format, args...)
 }
 
 // Info logs an INFO-level message.
-func Info(args ...interface{}) {
+func Info(args ...any) {
 	logln(LevelInfo, "[INFO]", args...)
 }
 
 // Warnf logs a WARN-level formatted message.
-func Warnf(format string, args ...interface{}) {
+func Warnf(format string, args ...any) {
 	logf(LevelWarn, "[WARN]", format, args...)
 }
 
 // Warn logs a WARN-level message.
-func Warn(args ...interface{}) {
+func Warn(args ...any) {
 	logln(LevelWarn, "[WARN]", args...)
 }
 
 // Errorf logs an ERROR-level formatted message.
-func Errorf(format string, args ...interface{}) {
+func Errorf(format string, args ...any) {
 	logf(LevelError, "[ERROR]", format, args...)
 }
 
 // Error logs an ERROR-level message.
-func Error(args ...interface{}) {
+func Error(args ...any) {
 	logln(LevelError, "[ERROR]", args...)
 }
 
 // Fatalf logs an ERROR-level formatted message and exits the process.
-func Fatalf(format string, args ...interface{}) {
+func Fatalf(format string, args ...any) {
 	logf(LevelError, "[FATAL]", format, args...)
 	Close()
 	os.Exit(1)

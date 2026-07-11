@@ -21,16 +21,16 @@ type ToolDef struct {
 	Type     string      `json:"type"`
 	Function ToolDefFunc `json:"function"`
 	// Anthropic-style fields (flat, no "function" wrapper)
-	Name        string                 `json:"name,omitempty"`
-	Description string                 `json:"description,omitempty"`
-	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema,omitempty"`
 }
 
 // ToolDefFunc is the OpenAI-style function definition inside a tool.
 type ToolDefFunc struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
 }
 
 // ToolCall represents a parsed tool call from the M365 response.
