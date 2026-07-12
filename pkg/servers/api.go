@@ -2884,16 +2884,31 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 func parseResponsesSimulationWithRetry(
 	text string,
 	policy responsesToolPolicy,
-	retry func() (string, error),
+	requiredRetry func() (string, error),
+	emptyRetry func() (string, error),
 ) (responsesSimulationResult, error) {
 	result, err := parseResponsesSimulation(text, policy)
-	if err == nil || retry == nil ||
+	if err == nil {
+		if emptyRetry == nil ||
+			!responsesResultEmpty(result.content, result.toolCalls) {
+			return result, nil
+		}
+		retryText, retryErr := emptyRetry()
+		if retryErr != nil {
+			return responsesSimulationResult{}, fmt.Errorf(
+				"empty simulated response retry failed: %w",
+				retryErr,
+			)
+		}
+		return parseResponsesSimulation(retryText, policy)
+	}
+	if requiredRetry == nil ||
 		!errors.Is(err, errSimulatedToolCallRequired) {
 		return result, err
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		retryText, retryErr := retry()
+		retryText, retryErr := requiredRetry()
 		if retryErr != nil {
 			return responsesSimulationResult{}, fmt.Errorf(
 				"%w: retry failed: %v",
@@ -2951,8 +2966,8 @@ func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
 }
 
 var responsesPlainEmptyRetryDelays = []time.Duration{
-	250 * time.Millisecond,
-	750 * time.Millisecond,
+	10 * time.Second,
+	30 * time.Second,
 }
 
 func responsesEmptyRetrySchedule(simulateTools bool) []time.Duration {
@@ -3068,10 +3083,7 @@ func responsesStreamWithEmptyRetry(
 				}
 				if chunk.IsFinal {
 					sawFinal = true
-					finalToolCallsVisible :=
-						!bufferUntilFinal && len(chunk.ToolCalls) > 0
-					if sawVisibleChunk || finalToolCallsVisible ||
-						attempt >= len(retryDelays) {
+					if sawVisibleChunk || attempt >= len(retryDelays) {
 						for _, buffered := range bufferedChunks {
 							if !emit(buffered) {
 								return
@@ -3720,6 +3732,19 @@ func (api *APIServer) responsesConversationOnce(
 	}, err
 }
 
+func (api *APIServer) responsesRequestCanceled(
+	ctx context.Context,
+	sid string,
+) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	if sid != "" && api.ctxCache != nil {
+		api.ctxCache.Delete("session:" + sid)
+	}
+	return true
+}
+
 func (api *APIServer) responsesConversation(
 	ctx context.Context,
 	messages []payload.Message,
@@ -3778,7 +3803,7 @@ func (api *APIServer) nonStreamResponses(
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		if ctx.Err() != nil {
+		if api.responsesRequestCanceled(ctx, sid) {
 			return
 		}
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
@@ -3801,6 +3826,9 @@ func (api *APIServer) nonStreamResponses(
 			respText,
 			toolPolicy,
 			func() (string, error) {
+				if sid != "" {
+					api.ctxCache.Delete("session:" + sid)
+				}
 				retryResult, retryErr := api.responsesConversationOnce(
 					ctx,
 					responsesSimulationRetryMessages(messages, toolPolicy),
@@ -3818,15 +3846,53 @@ func (api *APIServer) nonStreamResponses(
 				finalConvID = retryResult.conversationID
 				return retryResult.text, nil
 			},
+			func() (string, error) {
+				if sid != "" {
+					api.ctxCache.Delete("session:" + sid)
+				}
+				retryResult, retryErr := api.responsesConversationOnce(
+					ctx,
+					messages,
+					cfg,
+					"",
+					true,
+				)
+				if retryErr != nil {
+					return "", retryErr
+				}
+				respText = retryResult.text
+				thinking = retryResult.thinking
+				toolCalls = nil
+				finishReason = retryResult.finishReason
+				finalConvID = retryResult.conversationID
+				return retryResult.text, nil
+			},
 		)
 		if parseErr != nil {
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			if ctx.Err() != nil {
+			if api.responsesRequestCanceled(ctx, sid) {
 				return
 			}
-			writeResponsesSimulationError(w, false, "", cfg.OpenAIID, parseErr)
+			if errors.Is(parseErr, errSimulatedToolCallRequired) {
+				writeResponsesSimulationError(
+					w,
+					false,
+					"",
+					cfg.OpenAIID,
+					parseErr,
+				)
+			} else {
+				writeResponsesServerError(
+					w,
+					false,
+					"",
+					cfg.OpenAIID,
+					"upstream_error",
+					parseErr.Error(),
+				)
+			}
 			return
 		}
 		respText = simulated.content
@@ -3987,7 +4053,6 @@ func (api *APIServer) streamResponses(
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
 
 	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			if sid != "" {
@@ -3999,7 +4064,6 @@ func (api *APIServer) streamResponses(
 
 		if chunk.IsFinal {
 			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -4121,12 +4185,11 @@ func (api *APIServer) streamResponses(
 			}
 		}
 	}
-	if ctx.Err() != nil {
+	if api.responsesRequestCanceled(ctx, sid) {
 		return
 	}
-	_ = finalToolCalls
 
-	if !toolCallingEnabled && responsesResultEmpty(fullText, finalToolCalls) {
+	if !toolCallingEnabled && responsesResultEmpty(fullText, nil) {
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
@@ -4179,9 +4242,32 @@ func (api *APIServer) streamResponses(
 			fullText,
 			toolPolicy,
 			func() (string, error) {
+				if sid != "" {
+					api.ctxCache.Delete("session:" + sid)
+				}
 				retryResult, retryErr := api.responsesConversationOnce(
 					ctx,
 					responsesSimulationRetryMessages(messages, toolPolicy),
+					cfg,
+					"",
+					true,
+				)
+				if retryErr != nil {
+					return "", retryErr
+				}
+				fullText = retryResult.text
+				finalConvID = retryResult.conversationID
+				contentExtractor = toolcalling.ContentStreamExtractor{}
+				contentExtractor.Feed(retryResult.text)
+				return retryResult.text, nil
+			},
+			func() (string, error) {
+				if sid != "" {
+					api.ctxCache.Delete("session:" + sid)
+				}
+				retryResult, retryErr := api.responsesConversationOnce(
+					ctx,
+					messages,
 					cfg,
 					"",
 					true,
@@ -4200,10 +4286,17 @@ func (api *APIServer) streamResponses(
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			if ctx.Err() != nil {
+			if api.responsesRequestCanceled(ctx, sid) {
 				return
 			}
-			sendFailed(simulatedToolCallRequiredCode, parseErr.Error())
+			if errors.Is(parseErr, errSimulatedToolCallRequired) {
+				sendFailed(
+					simulatedToolCallRequiredCode,
+					parseErr.Error(),
+				)
+			} else {
+				sendFailed("upstream_error", parseErr.Error())
+			}
 			return
 		}
 		committedContent := contentExtractor.Commit(

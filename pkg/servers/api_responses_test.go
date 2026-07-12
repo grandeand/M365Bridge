@@ -160,6 +160,7 @@ func TestParseResponsesSimulationWithRetryAcceptsRequiredToolCall(t *testing.T) 
 			retries++
 			return simulatedToolCallEnvelope("read_nonce"), nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("required tool retry failed: %v", err)
@@ -196,6 +197,7 @@ func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 			}
 			return simulatedToolCallEnvelope("read_nonce"), nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("second required tool retry failed: %v", err)
@@ -206,6 +208,40 @@ func TestParseResponsesSimulationWithRetryAllowsSecondRetry(t *testing.T) {
 	if len(result.toolCalls) != 1 ||
 		result.toolCalls[0].Function.Name != "read_nonce" {
 		t.Fatalf("unexpected second-retry tool calls: %#v", result.toolCalls)
+	}
+}
+
+func TestParseResponsesSimulationWithRetryRetriesEmptyAutoResult(t *testing.T) {
+	policy, err := newResponsesToolPolicy(responsesTestTools(), "auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := "```json\n" +
+		`{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]},"finish_reason":"stop"}]}` +
+		"\n```"
+	retries := 0
+
+	result, err := parseResponsesSimulationWithRetry(
+		empty,
+		policy,
+		nil,
+		func() (string, error) {
+			retries++
+			return "```json\n" +
+					`{"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}` +
+					"\n```",
+				nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("empty auto simulation retry failed: %v", err)
+	}
+	if retries != 1 || result.content != "recovered" {
+		t.Fatalf(
+			"empty auto retry result = %#v after %d retries",
+			result,
+			retries,
+		)
 	}
 }
 
@@ -831,17 +867,25 @@ func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
 }
 
 func TestResponsesEmptyRetryBudgetDependsOnSimulation(t *testing.T) {
-	if got := len(responsesEmptyRetrySchedule(false)); got != 2 {
+	plain := responsesEmptyRetrySchedule(false)
+	if got := len(plain); got != 2 {
 		t.Fatalf(
 			"plain empty retry delays = %d, want two retries",
 			got,
 		)
 	}
-	if got := len(responsesEmptyRetrySchedule(true)); got != 1 {
+	if plain[0] != 10*time.Second || plain[1] != 30*time.Second {
+		t.Fatalf("plain retry schedule = %v, want [10s 30s]", plain)
+	}
+	simulated := responsesEmptyRetrySchedule(true)
+	if got := len(simulated); got != 1 {
 		t.Fatalf(
 			"simulated empty retry delays = %d, want one retry",
 			got,
 		)
+	}
+	if simulated[0] != 10*time.Second {
+		t.Fatalf("simulated retry schedule = %v, want [10s]", simulated)
 	}
 }
 
@@ -1049,7 +1093,7 @@ func TestResponsesStreamDoesNotRetryAfterVisibleChunk(t *testing.T) {
 	}
 }
 
-func TestResponsesStreamDoesNotRetryFinalToolCall(t *testing.T) {
+func TestResponsesStreamRetriesHiddenBackendToolCall(t *testing.T) {
 	attempts := 0
 	toolCall := client.ToolCall{
 		ID:   "call_test",
@@ -1068,6 +1112,12 @@ func TestResponsesStreamDoesNotRetryFinalToolCall(t *testing.T) {
 		nil,
 		func(_ context.Context, _ string) <-chan client.StreamChunk {
 			attempts++
+			if attempts == 2 {
+				return responsesTestChunkStream(
+					client.StreamChunk{Text: "recovered"},
+					client.StreamChunk{IsFinal: true},
+				)
+			}
 			return responsesTestChunkStream(client.StreamChunk{
 				IsFinal:   true,
 				ToolCalls: []client.ToolCall{toolCall},
@@ -1079,11 +1129,12 @@ func TestResponsesStreamDoesNotRetryFinalToolCall(t *testing.T) {
 	for chunk := range ch {
 		chunks = append(chunks, chunk)
 	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1 for a final tool call", attempts)
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want hidden tool call to retry", attempts)
 	}
-	if len(chunks) != 1 || len(chunks[0].ToolCalls) != 1 {
-		t.Fatalf("tool-call stream changed: %#v", chunks)
+	if len(chunks) != 2 || chunks[0].Text != "recovered" ||
+		!chunks[1].IsFinal {
+		t.Fatalf("hidden backend tool call escaped: %#v", chunks)
 	}
 }
 
@@ -1154,6 +1205,22 @@ func TestResponsesStreamWithoutFinalReturnsUpstreamError(t *testing.T) {
 	if len(chunks) != 2 || chunks[0].Text != "partial" ||
 		chunks[1].Error == nil {
 		t.Fatalf("broken stream did not end with an error: %#v", chunks)
+	}
+}
+
+func TestCanceledResponsesRequestClearsStickySession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cache := NewContextCache(t.TempDir())
+	sid := "canceled-session"
+	cache.Set("session:"+sid, "conv-poisoned")
+	api := &APIServer{ctxCache: cache}
+
+	if !api.responsesRequestCanceled(ctx, sid) {
+		t.Fatal("canceled Responses request was not detected")
+	}
+	if got := cache.Get("session:" + sid); got != "" {
+		t.Fatalf("canceled Responses request kept sticky session %q", got)
 	}
 }
 
