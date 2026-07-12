@@ -2950,23 +2950,37 @@ func responsesResultEmpty(text string, toolCalls []client.ToolCall) bool {
 	return strings.TrimSpace(text) == "" && len(toolCalls) == 0
 }
 
+func buildResponsesFailedEvent(
+	responseID, model, code, message string,
+	sequenceNumber int,
+) map[string]interface{} {
+	return map[string]interface{}{
+		"type":            "response.failed",
+		"sequence_number": sequenceNumber,
+		"response": map[string]interface{}{
+			"id":     responseID,
+			"object": "response",
+			"status": "failed",
+			"model":  model,
+			"error": map[string]interface{}{
+				"message": message,
+				"type":    "server_error",
+				"code":    code,
+			},
+		},
+	}
+}
+
 func writeResponsesServerError(w http.ResponseWriter, stream bool, responseID, model, code, message string) {
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
-		event := map[string]interface{}{
-			"type": "response.failed",
-			"response": map[string]interface{}{
-				"id":     responseID,
-				"object": "response",
-				"status": "failed",
-				"model":  model,
-				"error": map[string]interface{}{
-					"message": message,
-					"type":    "server_error",
-					"code":    code,
-				},
-			},
-		}
+		event := buildResponsesFailedEvent(
+			responseID,
+			model,
+			code,
+			message,
+			0,
+		)
 		jsonData, _ := json.Marshal(event)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		fmt.Fprint(w, "data: [DONE]\n\n")
@@ -3623,6 +3637,20 @@ func (api *APIServer) streamResponses(
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
 	}
+	sendFailed := func(code, message string) {
+		event := buildResponsesFailedEvent(
+			responseID,
+			openaiModel,
+			code,
+			message,
+			sequenceNumber,
+		)
+		sequenceNumber++
+		jsonData, _ := json.Marshal(event)
+		fmt.Fprintf(w, "data: %s\n\n", jsonData)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
 
 	// Send response.created event
 	sendEvent("response.created", map[string]any{
@@ -3677,18 +3705,7 @@ func (api *APIServer) streamResponses(
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			sendEvent("response.failed", map[string]any{
-				"response": map[string]any{
-					"id":     responseID,
-					"object": "response",
-					"status": "failed",
-					"error": map[string]any{
-						"message": chunk.Error.Error(),
-						"type":    "server_error",
-					},
-					"model": openaiModel,
-				},
-			})
+			sendFailed("upstream_error", chunk.Error.Error())
 			return
 		}
 
@@ -3825,11 +3842,9 @@ func (api *APIServer) streamResponses(
 		if sid != "" {
 			api.ctxCache.Delete("session:" + sid)
 		}
-		writeResponsesUpstreamEmptyError(
-			w,
-			true,
-			responseID,
-			openaiModel,
+		sendFailed(
+			upstreamEmptyResponseCode,
+			"The upstream completed without assistant content or a tool call.",
 		)
 		return
 	}
@@ -3900,7 +3915,7 @@ func (api *APIServer) streamResponses(
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			writeResponsesSimulationError(w, true, responseID, openaiModel, parseErr)
+			sendFailed(simulatedToolCallRequiredCode, parseErr.Error())
 			return
 		}
 		committedContent := contentExtractor.Commit(
@@ -3917,11 +3932,9 @@ func (api *APIServer) streamResponses(
 			if sid != "" {
 				api.ctxCache.Delete("session:" + sid)
 			}
-			writeResponsesUpstreamEmptyError(
-				w,
-				true,
-				responseID,
-				openaiModel,
+			sendFailed(
+				upstreamEmptyResponseCode,
+				"The upstream completed without assistant content or a tool call.",
 			)
 			return
 		}

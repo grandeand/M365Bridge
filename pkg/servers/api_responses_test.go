@@ -787,6 +787,27 @@ func TestWriteResponsesSimulationErrorStreaming(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesFailedEventIncludesSequenceNumber(t *testing.T) {
+	event := buildResponsesFailedEvent(
+		"resp_test",
+		"gpt-test",
+		"upstream_timeout",
+		"timed out",
+		7,
+	)
+	if got := event["sequence_number"]; got != 7 {
+		t.Fatalf("sequence_number = %#v, want 7", got)
+	}
+	response, ok := event["response"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response payload has wrong type: %#v", event["response"])
+	}
+	errorPayload, ok := response["error"].(map[string]interface{})
+	if !ok || errorPayload["code"] != "upstream_timeout" {
+		t.Fatalf("error payload mismatch: %#v", response["error"])
+	}
+}
+
 func TestResponsesResultRequiresVisibleOutput(t *testing.T) {
 	call := client.ToolCall{ID: "call_test"}
 	tests := []struct {
