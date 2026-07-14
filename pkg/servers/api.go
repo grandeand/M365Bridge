@@ -2772,6 +2772,14 @@ func mergeLoadedResponsesTools(input interface{}, tools []toolcalling.ToolDef) [
 	return tools
 }
 
+func responsesCustomToolInput(arguments string) string {
+	var input string
+	if json.Unmarshal([]byte(arguments), &input) == nil {
+		return input
+	}
+	return arguments
+}
+
 func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]interface{} {
 	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
 	if toolTypes[toolKey] == "tool_search" {
@@ -2787,6 +2795,23 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 			"call_id":   callID,
 			"arguments": arguments,
 		}
+	}
+	if toolTypes[toolKey] == "custom" {
+		item := map[string]interface{}{
+			"id":      callID,
+			"type":    "custom_tool_call",
+			"status":  status,
+			"call_id": callID,
+			"name":    call.Function.Name,
+			"input":   "",
+		}
+		if call.Function.Namespace != "" {
+			item["namespace"] = call.Function.Namespace
+		}
+		if status == "completed" {
+			item["input"] = responsesCustomToolInput(call.Function.Arguments)
+		}
+		return item
 	}
 	item := map[string]interface{}{
 		"id":      callID,
@@ -3488,8 +3513,8 @@ func responsesInputToMessages(input any) []payload.Message {
 
 		itemType, _ := m["type"].(string)
 
-		// Handle function_call_output items (tool results)
-		if itemType == "function_call_output" {
+		// Handle function/custom tool output items (tool results).
+		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
 			callID, _ := m["call_id"].(string)
 			output, _ := m["output"].(string)
 			if output == "" && m["output"] != nil {
@@ -3508,11 +3533,14 @@ func responsesInputToMessages(input any) []payload.Message {
 			continue
 		}
 
-		// Handle function_call items (assistant tool calls in input history)
-		if itemType == "function_call" {
+		// Handle function/custom tool calls in input history.
+		if itemType == "function_call" || itemType == "custom_tool_call" {
 			name, _ := m["name"].(string)
 			namespace, _ := m["namespace"].(string)
 			args, _ := m["arguments"].(string)
+			if itemType == "custom_tool_call" {
+				args, _ = m["input"].(string)
+			}
 			qualifiedName := name
 			if namespace != "" {
 				qualifiedName = namespace + "/" + name
@@ -4530,12 +4558,26 @@ func (api *APIServer) streamResponses(
 				tc.Function.Namespace,
 				tc.Function.Name,
 			)
-			isToolSearch := toolTypes[toolKey] == "tool_search"
+			toolType := toolTypes[toolKey]
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
 				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
 			})
-			if !isToolSearch {
+			switch toolType {
+			case "tool_search":
+			case "custom":
+				input := responsesCustomToolInput(tc.Function.Arguments)
+				sendEvent("response.custom_tool_call_input.delta", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"delta":        input,
+				})
+				sendEvent("response.custom_tool_call_input.done", map[string]interface{}{
+					"item_id":      callID,
+					"output_index": outputIdx,
+					"input":        input,
+				})
+			default:
 				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
 					"item_id":      callID,
 					"output_index": outputIdx,

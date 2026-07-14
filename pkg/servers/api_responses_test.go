@@ -406,6 +406,35 @@ func TestBuildResponsesToolCallItemUsesDeclaredBuiltInType(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesToolCallItemUsesDeclaredCustomType(t *testing.T) {
+	const patch = "*** Begin Patch\n*** End Patch"
+	call := client.ToolCall{
+		ID:   "call_patch",
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      "apply_patch",
+			Arguments: `"*** Begin Patch\n*** End Patch"`,
+		},
+	}
+
+	item := buildResponsesToolCallItem(
+		"call_patch",
+		call,
+		map[string]string{"apply_patch": "custom"},
+		"completed",
+	)
+
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("custom tool item type = %#v, want custom_tool_call", item["type"])
+	}
+	if item["input"] != patch {
+		t.Fatalf("custom tool input = %#v, want %q", item["input"], patch)
+	}
+	if _, ok := item["arguments"]; ok {
+		t.Fatalf("custom tool unexpectedly emitted function arguments: %#v", item)
+	}
+}
+
 func TestBuildResponsesToolCallItemIncludesNamespace(t *testing.T) {
 	call := client.ToolCall{
 		ID:   "call_js",
@@ -615,6 +644,35 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T
 		if !strings.Contains(strings.ToLower(messages[0].Content), strings.ToLower(expected)) {
 			t.Fatalf("function result lost %q: %s", expected, messages[0].Content)
 		}
+	}
+}
+
+func TestResponsesCustomToolStateBecomesAuthoritativeToolHistory(t *testing.T) {
+	messages := responsesInputToMessages([]interface{}{
+		map[string]interface{}{
+			"type":    "custom_tool_call",
+			"call_id": "call_patch",
+			"name":    "apply_patch",
+			"input":   "*** Begin Patch\n*** End Patch",
+		},
+		map[string]interface{}{
+			"type":    "custom_tool_call_output",
+			"call_id": "call_patch",
+			"output":  "Done!",
+		},
+	})
+
+	if len(messages) != 2 {
+		t.Fatalf("message count = %d, want 2: %#v", len(messages), messages)
+	}
+	if messages[0].Role != "assistant" ||
+		!strings.Contains(messages[0].Content, "apply_patch") ||
+		!strings.Contains(messages[0].Content, "*** Begin Patch") {
+		t.Fatalf("custom tool call history was not preserved: %#v", messages[0])
+	}
+	if messages[1].Role != "tool" || messages[1].ToolCallID != "call_patch" ||
+		!strings.Contains(messages[1].Content, "Done!") {
+		t.Fatalf("custom tool output history was not preserved: %#v", messages[1])
 	}
 }
 
