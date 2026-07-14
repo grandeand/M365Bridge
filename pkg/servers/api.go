@@ -2780,6 +2780,115 @@ func responsesCustomToolInput(arguments string) string {
 	return arguments
 }
 
+func responsesCustomToolItemID(callID string) string {
+	return "ctc_" + callID
+}
+
+func buildResponsesCustomToolInputEvents(
+	itemID string,
+	callID string,
+	outputIndex int,
+	input string,
+) []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"type":         "response.custom_tool_call_input.delta",
+			"item_id":      itemID,
+			"call_id":      callID,
+			"output_index": outputIndex,
+			"delta":        input,
+		},
+		{
+			"type":         "response.custom_tool_call_input.done",
+			"item_id":      itemID,
+			"call_id":      callID,
+			"output_index": outputIndex,
+			"input":        input,
+		},
+	}
+}
+
+func responsesGoalContinuationOpen(input interface{}) bool {
+	items, ok := input.([]interface{})
+	if !ok {
+		return false
+	}
+
+	latestGoalUser := -1
+	for index, item := range items {
+		record, ok := item.(map[string]interface{})
+		if !ok || record["role"] != "user" {
+			continue
+		}
+		if strings.Contains(
+			responsesExtractContent(record["content"]),
+			`<codex_internal_context source="goal">`,
+		) {
+			latestGoalUser = index
+		} else {
+			latestGoalUser = -1
+		}
+	}
+	if latestGoalUser < 0 {
+		return false
+	}
+
+	updateGoalCalls := map[string]bool{}
+	for _, item := range items[latestGoalUser+1:] {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		itemType, _ := record["type"].(string)
+		if itemType != "function_call" && itemType != "custom_tool_call" {
+			continue
+		}
+		name, _ := record["name"].(string)
+		callID, _ := record["call_id"].(string)
+		if name == "update_goal" && callID != "" {
+			updateGoalCalls[callID] = true
+		}
+	}
+
+	for _, item := range items[latestGoalUser+1:] {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		itemType, _ := record["type"].(string)
+		if itemType != "function_call_output" &&
+			itemType != "custom_tool_call_output" {
+			continue
+		}
+		callID, _ := record["call_id"].(string)
+		if !updateGoalCalls[callID] {
+			continue
+		}
+		output, _ := record["output"].(string)
+		var payload struct {
+			Goal struct {
+				Status string `json:"status"`
+			} `json:"goal"`
+		}
+		if json.Unmarshal([]byte(output), &payload) == nil &&
+			(payload.Goal.Status == "complete" ||
+				payload.Goal.Status == "blocked") {
+			return false
+		}
+	}
+	return true
+}
+
+func responsesMessagePhase(
+	input interface{},
+	toolCalls []client.ToolCall,
+) string {
+	if len(toolCalls) > 0 || responsesGoalContinuationOpen(input) {
+		return "commentary"
+	}
+	return "final_answer"
+}
+
 func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes map[string]string, status string) map[string]interface{} {
 	toolKey := responsesToolKey(call.Function.Namespace, call.Function.Name)
 	if toolTypes[toolKey] == "tool_search" {
@@ -2798,7 +2907,7 @@ func buildResponsesToolCallItem(callID string, call client.ToolCall, toolTypes m
 	}
 	if toolTypes[toolKey] == "custom" {
 		item := map[string]interface{}{
-			"id":      callID,
+			"id":      responsesCustomToolItemID(callID),
 			"type":    "custom_tool_call",
 			"status":  status,
 			"call_id": callID,
@@ -3452,6 +3561,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		api.respondBufferedResponses(
 			w,
 			result,
+			req.Input,
 			messages,
 			cfg,
 			sid,
@@ -3465,6 +3575,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		api.streamResponses(
 			r.Context(),
 			w,
+			req.Input,
 			messages,
 			cfg,
 			sid,
@@ -3476,6 +3587,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		api.nonStreamResponses(
 			r.Context(),
 			w,
+			req.Input,
 			messages,
 			cfg,
 			sid,
@@ -3644,7 +3756,7 @@ func responsesExtractContent(content any) string {
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
-func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, toolTypes map[string]string, finishReason string, promptTok, completionTok, reasoningTok int) map[string]any {
+func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, toolTypes map[string]string, input interface{}, finishReason string, promptTok, completionTok, reasoningTok int) map[string]any {
 	status := "completed"
 	if finishReason == "length" {
 		status = "incomplete"
@@ -3673,10 +3785,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	// Add message item with output_text (only if there is text content)
 	if text != "" || len(toolCalls) == 0 {
 		msgID := fmt.Sprintf("msg_%s", responseID)
-		phase := "final_answer"
-		if len(toolCalls) > 0 {
-			phase = "commentary"
-		}
+		phase := responsesMessagePhase(input, toolCalls)
 		output = append(output, map[string]any{
 			"id":     msgID,
 			"type":   "message",
@@ -3722,7 +3831,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	return resp
 }
 
-func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string) {
+func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, input interface{}, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string) {
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
 			result.text, result.finishReason = truncated, "length"
@@ -3732,7 +3841,7 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 		api.ctxCache.Set("session:"+sid, result.conversationID)
 	}
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
-	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, toolTypes, result.finishReason, countTokens(fmt.Sprint(messages)), countTokens(result.text), countTokens(result.thinking))
+	response := buildResponsesObject(responseID, cfg.OpenAIID, result.text, result.thinking, result.toolCalls, toolTypes, input, result.finishReason, countTokens(fmt.Sprint(messages)), countTokens(result.text), countTokens(result.thinking))
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
 		return
@@ -3822,6 +3931,7 @@ func (api *APIServer) responsesConversation(
 func (api *APIServer) nonStreamResponses(
 	ctx context.Context,
 	w http.ResponseWriter,
+	input interface{},
 	messages []payload.Message,
 	cfg models.ModelConfig,
 	sid, convID string,
@@ -3968,7 +4078,7 @@ func (api *APIServer) nonStreamResponses(
 	reasoningTok := countTokens(thinking)
 
 	responseID := fmt.Sprintf("resp_%s", uuid.New().String())
-	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
+	response := buildResponsesObject(responseID, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), input, finishReason, promptTok, completionTok, reasoningTok)
 
 	api.sendJSON(w, http.StatusOK, response)
 
@@ -3986,6 +4096,7 @@ func (api *APIServer) nonStreamResponses(
 func (api *APIServer) streamResponses(
 	ctx context.Context,
 	w http.ResponseWriter,
+	input interface{},
 	messages []payload.Message,
 	cfg models.ModelConfig,
 	sid, convID string,
@@ -4433,10 +4544,7 @@ func (api *APIServer) streamResponses(
 		}
 
 		if messageItemEmitted {
-			phase := "final_answer"
-			if len(toolCalls) > 0 {
-				phase = "commentary"
-			}
+			phase := responsesMessagePhase(input, toolCalls)
 			sendEvent("response.output_text.done", map[string]interface{}{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
@@ -4479,10 +4587,7 @@ func (api *APIServer) streamResponses(
 					finishReason = "length"
 				}
 			}
-			phase := "final_answer"
-			if len(toolCalls) > 0 {
-				phase = "commentary"
-			}
+			phase := responsesMessagePhase(input, toolCalls)
 
 			sendEvent("response.output_item.added", map[string]any{
 				"output_index": outputIdx,
@@ -4567,16 +4672,17 @@ func (api *APIServer) streamResponses(
 			case "tool_search":
 			case "custom":
 				input := responsesCustomToolInput(tc.Function.Arguments)
-				sendEvent("response.custom_tool_call_input.delta", map[string]interface{}{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"delta":        input,
-				})
-				sendEvent("response.custom_tool_call_input.done", map[string]interface{}{
-					"item_id":      callID,
-					"output_index": outputIdx,
-					"input":        input,
-				})
+				itemID := responsesCustomToolItemID(callID)
+				for _, event := range buildResponsesCustomToolInputEvents(
+					itemID,
+					callID,
+					outputIdx,
+					input,
+				) {
+					eventType, _ := event["type"].(string)
+					delete(event, "type")
+					sendEvent(eventType, event)
+				}
 			default:
 				sendEvent("response.function_call_arguments.delta", map[string]interface{}{
 					"item_id":      callID,
@@ -4629,7 +4735,7 @@ func (api *APIServer) streamResponses(
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
-					"phase":  "final_answer",
+					"phase":  responsesMessagePhase(input, toolCalls),
 					"content": []map[string]any{
 						{
 							"type":        "output_text",
@@ -4654,7 +4760,7 @@ func (api *APIServer) streamResponses(
 	reasoningText := thinkingText.String()
 	reasoningTok := countTokens(reasoningText)
 
-	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), input, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
 	sendEvent("response.completed", map[string]any{

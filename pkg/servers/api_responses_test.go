@@ -355,6 +355,7 @@ func TestBuildResponsesObjectPlacesCommentaryBeforeToolCall(t *testing.T) {
 		"",
 		[]client.ToolCall{call},
 		map[string]string{"read_nonce": "function"},
+		nil,
 		"tool_calls",
 		1,
 		1,
@@ -427,11 +428,84 @@ func TestBuildResponsesToolCallItemUsesDeclaredCustomType(t *testing.T) {
 	if item["type"] != "custom_tool_call" {
 		t.Fatalf("custom tool item type = %#v, want custom_tool_call", item["type"])
 	}
+	if item["id"] == item["call_id"] {
+		t.Fatalf("custom tool item id must differ from call_id: %#v", item)
+	}
+	if !strings.HasPrefix(item["id"].(string), "ctc_") {
+		t.Fatalf("custom tool item id = %#v, want ctc_ prefix", item["id"])
+	}
 	if item["input"] != patch {
 		t.Fatalf("custom tool input = %#v, want %q", item["input"], patch)
 	}
 	if _, ok := item["arguments"]; ok {
 		t.Fatalf("custom tool unexpectedly emitted function arguments: %#v", item)
+	}
+}
+
+func TestResponsesCustomToolInputEventsIncludeItemAndCallIDs(t *testing.T) {
+	events := buildResponsesCustomToolInputEvents(
+		"ctc_call_exec",
+		"call_exec",
+		3,
+		"const value = 1;",
+	)
+	if len(events) != 2 {
+		t.Fatalf("custom tool input event count = %d, want 2", len(events))
+	}
+	for _, event := range events {
+		if event["item_id"] != "ctc_call_exec" {
+			t.Fatalf("custom tool event item_id = %#v", event["item_id"])
+		}
+		if event["call_id"] != "call_exec" {
+			t.Fatalf("custom tool event call_id = %#v", event["call_id"])
+		}
+	}
+}
+
+func TestResponsesGoalContinuationWithoutClosureUsesCommentary(t *testing.T) {
+	input := []interface{}{
+		map[string]interface{}{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "input_text",
+					"text": `<codex_internal_context source="goal">Continue working toward the active thread goal.</codex_internal_context>`,
+				},
+			},
+		},
+	}
+
+	if phase := responsesMessagePhase(input, nil); phase != "commentary" {
+		t.Fatalf("active goal continuation phase = %q, want commentary", phase)
+	}
+}
+
+func TestResponsesGoalContinuationAfterCompleteUsesFinalAnswer(t *testing.T) {
+	input := []interface{}{
+		map[string]interface{}{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "input_text",
+					"text": `<codex_internal_context source="goal">Continue working toward the active thread goal.</codex_internal_context>`,
+				},
+			},
+		},
+		map[string]interface{}{
+			"type":      "function_call",
+			"call_id":   "call_close",
+			"name":      "update_goal",
+			"arguments": `{"status":"complete"}`,
+		},
+		map[string]interface{}{
+			"type":    "function_call_output",
+			"call_id": "call_close",
+			"output":  `{"goal":{"status":"complete"}}`,
+		},
+	}
+
+	if phase := responsesMessagePhase(input, nil); phase != "final_answer" {
+		t.Fatalf("closed goal continuation phase = %q, want final_answer", phase)
 	}
 }
 
