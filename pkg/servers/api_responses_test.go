@@ -442,6 +442,28 @@ func TestBuildResponsesToolCallItemUsesDeclaredCustomType(t *testing.T) {
 	}
 }
 
+func TestResponsesToolTypesPrefersCustomDuplicate(t *testing.T) {
+	for _, tools := range [][]toolcalling.ToolDef{
+		{
+			{Type: "custom", Name: "exec"},
+			{Type: "function", Name: "exec"},
+		},
+		{
+			{Type: "function", Name: "exec"},
+			{Type: "custom", Name: "exec"},
+		},
+	} {
+		types := responsesToolTypes(tools)
+		if types["exec"] != "custom" {
+			t.Fatalf(
+				"duplicate exec type = %q, want custom; tools=%#v",
+				types["exec"],
+				tools,
+			)
+		}
+	}
+}
+
 func TestResponsesCustomToolInputEventsIncludeItemAndCallIDs(t *testing.T) {
 	events := buildResponsesCustomToolInputEvents(
 		"ctc_call_exec",

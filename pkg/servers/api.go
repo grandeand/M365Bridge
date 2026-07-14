@@ -2686,7 +2686,11 @@ func responsesToolTypes(tools []toolcalling.ToolDef) map[string]string {
 		if toolType == "" {
 			toolType = "function"
 		}
-		types[responsesToolKey(tool.Namespace, name)] = toolType
+		key := responsesToolKey(tool.Namespace, name)
+		if types[key] == "custom" {
+			continue
+		}
+		types[key] = toolType
 	}
 	return types
 }
