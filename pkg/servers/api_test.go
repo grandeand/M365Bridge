@@ -42,3 +42,37 @@ func TestResponsesInputToMessagesPreservesFunctionCallOutputID(t *testing.T) {
 		t.Fatalf("message content = %q, want call ID and output", messages[0].Content)
 	}
 }
+
+func TestResponsesInputToMessagesPreservesInputImage(t *testing.T) {
+	input := []any{
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "input_text",
+					"text": "What is in this image?",
+				},
+				map[string]any{
+					"type":      "input_image",
+					"image_url": "data:image/png;base64,cG5n",
+				},
+			},
+		},
+	}
+
+	messages := responsesInputToMessages(input)
+	if len(messages) != 1 {
+		t.Fatalf("responsesInputToMessages() returned %d messages, want 1", len(messages))
+	}
+	if messages[0].Content != "What is in this image?" {
+		t.Fatalf("message content = %q, want input text", messages[0].Content)
+	}
+	if len(messages[0].Images) != 1 {
+		t.Fatalf("message images = %d, want 1", len(messages[0].Images))
+	}
+	image := messages[0].Images[0]
+	if image.Base64 != "cG5n" || image.MediaType != "image/png" || image.FileName != "upload.png" {
+		t.Fatalf("message image = %#v, want parsed PNG data URL", image)
+	}
+}

@@ -176,7 +176,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	for _, block := range blocks {
 		blockType, _ := block["type"].(string)
 		switch blockType {
-		case "text":
+		case "text", "input_text", "output_text":
 			if txt, ok := block["text"].(string); ok {
 				m.Content += txt
 			}
@@ -187,6 +187,13 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 					if img := parseDataURL(url); img != nil {
 						m.Images = append(m.Images, *img)
 					}
+				}
+			}
+		case "input_image":
+			// Responses API format: {"type":"input_image","image_url":"data:image/png;base64,..."}
+			if url, ok := block["image_url"].(string); ok {
+				if img := parseDataURL(url); img != nil {
+					m.Images = append(m.Images, *img)
 				}
 			}
 		case "image":

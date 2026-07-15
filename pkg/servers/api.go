@@ -3717,10 +3717,21 @@ func responsesInputToMessages(input any) []payload.Message {
 			role = "user"
 		}
 
-		content := responsesExtractContent(m["content"])
+		messageJSON, err := json.Marshal(map[string]any{
+			"role":    role,
+			"content": m["content"],
+		})
+		if err == nil {
+			var message payload.Message
+			if err := json.Unmarshal(messageJSON, &message); err == nil {
+				messages = append(messages, message)
+				continue
+			}
+		}
+
 		messages = append(messages, payload.Message{
 			Role:    role,
-			Content: content,
+			Content: responsesExtractContent(m["content"]),
 		})
 	}
 
